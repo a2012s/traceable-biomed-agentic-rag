@@ -1,0 +1,12 @@
+.env
+.qdrant_data/
+.agentic_rag.db*
+.agentic_rag_feedback.db*
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store

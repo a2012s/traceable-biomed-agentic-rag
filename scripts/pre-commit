@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Git pre-commit 钩子：阻止含密钥的文件进入仓库。
+# 安装：cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+set -euo pipefail
+
+# 只拦引号包裹的密钥字面量：api_key=s.active_api_key 这类属性引用是误报
+PATTERN="sk-[A-Za-z0-9._-]{16,}|api[_-]?key[[:space:]]*[:=][[:space:]]*['\"][^'\"]{16,}['\"]"
+BLOCKED=0
+
+# 只扫描本次暂存的文件（含本次新增/修改的内容）
+while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    if git show ":$file" 2>/dev/null | grep -nEi "$PATTERN" >/dev/null; then
+        echo "BLOCKED: $file 含疑似 API key，禁止提交" >&2
+        BLOCKED=1
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+# 显式禁止 .env 与向量库数据目录
+while IFS= read -r file; do
+    case "$file" in
+        .env.example) ;;  # 公开模板，所有 KEY 均为空值；README 启动步骤依赖它
+        .env|.env.*|*.env|.qdrant_data/*)
+            echo "BLOCKED: $file 属于敏感/运行时文件，禁止提交" >&2
+            BLOCKED=1
+            ;;
+    esac
+done < <(git diff --cached --name-only)
+
+if [ "$BLOCKED" -ne 0 ]; then
+    echo "提交已中止。请用 git restore --staged <file> 取消暂存。" >&2
+    exit 1
+fi
+exit 0

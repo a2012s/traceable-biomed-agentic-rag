@@ -1,0 +1,56 @@
+[project]
+name = "traceable-biomed-agentic-rag"
+version = "0.2.0"
+description = "Biomedical multi-agent Agentic RAG demo built with LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agentic-rag", "langgraph", "multi-agent", "rag", "biomedical", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langgraph>=0.2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "rank-bm25>=0.2.2",
+    "numpy>=1.26",
+    "tenacity>=8.5",
+]
+
+[project.optional-dependencies]
+real-vector = ["qdrant-client>=1.9"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+# 生产化：磁盘检查点（可选，缺失自动降级内存）
+production = ["langgraph-checkpoint-sqlite>=2.0"]
+dev = ["ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [".venv", ".qdrant_data", "build", "dist"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: import 排序, B: bugbear, C4: comprehension, SIM: 简化建议
+select = ["E", "W", "F", "I", "B", "C4", "SIM"]
+ignore = [
+    "E501",  # 长行由 line-length 控制，中文注释不硬折行
+    "B008",  # pydantic Field(...) 作为默认值是标准写法
+    "SIM108",  # 三元表达式并非总是更可读
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
