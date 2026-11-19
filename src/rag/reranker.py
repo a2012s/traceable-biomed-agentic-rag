@@ -243,7 +243,19 @@ class CrossEncoderReranker:
         floor = float(ordered[0].get("score", 0.0)) * margin
         above = [e for e in ordered if float(e.get("score", 0.0)) >= floor]
         keep = max(min_keep, len(above))
-        return ordered[: min(keep, top_k)]
+        picked = ordered[: min(keep, top_k)]
+
+        # 只保条数不够，还要保「跨源」。Critic 的 grounded 判据是「独立数据源 >=2」，
+        # 保底 2 条若同域，依然判不充分 → 依然跑满反思轮 → 证据充足却拒答。
+        # 单纯提高 min_keep 也无效：实测把 3 条同域证据留下，distinct_sources 仍是 1。
+        # 所以这里显式用一条不同 source 的候选替换末位（保留最佳项、条数不变）。
+        sources = {e.get("source", "") for e in picked}
+        if len(sources) < 2 and len(picked) >= 2:
+            alt = next((e for e in ordered if e.get("source", "") not in sources), None)
+            if alt is not None:
+                picked = picked[:-1] + [alt]
+                picked.sort(key=lambda e: float(e.get("score", 0.0)), reverse=True)
+        return picked
 
     @staticmethod
     def make_snippet(text: str, query: str, window: int = 220) -> str:

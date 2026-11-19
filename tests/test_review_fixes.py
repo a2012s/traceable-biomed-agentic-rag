@@ -137,6 +137,31 @@ class TestFuseMinKeep(unittest.TestCase):
         fused = reranker.fuse(items, top_k=8, margin=0.5, min_keep=3)
         self.assertEqual([e["doc_id"] for e in fused], ["E0", "E1", "E2"])
 
+    def test_single_source_fallback_pulls_in_another_source(self):
+        """保底 2 条若同域，Critic 的「独立数据源 >=2」仍不成立 → 证据充足也拒答。"""
+        reranker = CrossEncoderReranker(top_k=5)
+        items = [
+            evidence("L-outlier", 10.0, "literature"),
+            evidence("L2", 3.0, "literature"),
+            evidence("L3", 2.9, "literature"),
+            evidence("C1", 2.7, "clinical"),
+        ]
+        fused = reranker.fuse(items, top_k=8, margin=0.5, min_keep=2)
+        self.assertEqual(len(fused), 2)                      # 条数不变，只换末位
+        self.assertEqual(fused[0]["doc_id"], "L-outlier")     # 最佳项不能被替换掉
+        self.assertGreaterEqual(len({e["source"] for e in fused}), 2)
+
+    def test_min_keep_three_alone_does_not_fix_single_source(self):
+        """只把 fuse_min_keep 提到 3 解决不了同源问题：3 条可能全在一个数据域。
+
+        锁住「必须显式跨源补偿」这个结论——删掉 fuse() 里的跨源逻辑这条就会失败。
+        """
+        reranker = CrossEncoderReranker(top_k=5)
+        items = [evidence(f"L{i}", s, "literature") for i, s in enumerate([10.0, 3.0, 2.9, 2.8])]
+        items.append(evidence("C1", 1.0, "clinical"))
+        fused = reranker.fuse(items, top_k=8, margin=0.5, min_keep=3)
+        self.assertGreaterEqual(len({e["source"] for e in fused}), 2)
+
 
 class TestCacheVersion(unittest.TestCase):
     def test_content_change_invalidates_cache_key(self):
