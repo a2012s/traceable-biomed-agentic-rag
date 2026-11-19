@@ -15,12 +15,22 @@ from .config import get_settings
 
 
 def _corpus_version() -> str:
-    """用内置语料的文档数 + ID 列表摘要作为版本标识；接真实数据源时替换为数据源 commit/version。"""
+    """语料版本标识：文档数 + 每条文档的 ID 与正文摘要。
+
+    必须把正文纳入摘要。真实场景最常见的更新恰恰是「ID 不变、内容变」——
+    同一 PMID 的勘误、指南年度改版沿用同一编号、同一 NCT 号的方案修订。
+    只对 doc_id 做摘要时，缓存会继续命中旧答案，最长整整一个 TTL。
+    """
     from .data.corpus import build_index
 
     docs = build_index()
-    digest = hashlib.sha256("|".join(d.doc_id for d in docs).encode()).hexdigest()[:12]
-    return f"{len(docs)}-{digest}"
+    h = hashlib.sha256()
+    for d in docs:
+        h.update(d.doc_id.encode())
+        h.update(b"\x00")
+        h.update((d.title + "\n" + d.text).encode())
+        h.update(b"\x01")
+    return f"{len(docs)}-{h.hexdigest()[:12]}"
 
 
 def normalize_question(question: str) -> str:
@@ -36,16 +46,23 @@ class AnswerCache:
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def key(self, question: str) -> str:
+        from .agents.prompts import PROMPT_VERSION
+
         s = get_settings()
         parts = [
             normalize_question(question),
             _corpus_version(),
+            f"prompt-{PROMPT_VERSION}",
             str(s.embedding_backend),
             str(s.retrieve_top_k),
+            str(s.rerank_candidates),
             str(s.evidence_top_k),
             str(s.rerank_top_k),
+            str(s.fuse_margin),
+            str(s.fuse_min_keep),
             str(s.max_reflections),
             str(s.wide_recall),
+            str(s.entity_linking),
             s.active_model if not s.is_mock else "mock",
         ]
         return hashlib.sha256("||".join(parts).encode()).hexdigest()

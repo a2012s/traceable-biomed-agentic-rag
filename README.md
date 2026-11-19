@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)](tests)
 
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
@@ -31,7 +31,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "MS 的诊断标准是什么？"
 python eval.py                      # 检索评估，秒级，不烧 token
-python -m unittest discover -s tests -t .   # 42 项单元/行为测试
+python -m unittest discover -s tests -t .   # 56 项单元/行为测试
 ```
 
 `pip` 同样可用：`pip install -e ".[real-vector]"`。
@@ -176,7 +176,7 @@ src/
 | 三路召回 + RRF + 重排 + 证据窗口 | ✅ 真实算法（重排是特征打分，非神经网络） |
 | Qdrant 本地 HNSW / numpy 兜底 / 维度变更重建 | ✅ 真实实现 |
 | TF-IDF Embedding | ✅ 真实计算（离线可跑，非语义模型） |
-| hash Embedding | ⚠️ 降级兜底，明确标注语义能力弱 |
+| hash Embedding | ⚠️ 降级兜底，语义能力弱；用 crc32 投影，跨进程可复现（不用随机化的 `hash()`） |
 | Cross-Encoder 重排 | ⚠️ 用 IDF 加权余弦 + 先验模拟，`score()` 换成 bge-reranker 即可 |
 | 四个生物医学工具 | ⚠️ 本地语料模拟，`pubmed_search` 等替换为真实 API 即可 |
 | Critic | ⚠️ 规则判定（可解释、零成本），非 LLM judge |
@@ -199,8 +199,11 @@ src/
 | 外部重排 | `RERANKER_API_URL` | POST `{query,text}` → `{score}`，接真 cross-encoder；失败熔断降级内置打分 |
 | 流式接口 | 默认开 | `POST /api/ask/stream` SSE；当前推送粒度为整条链路完成，token 级需改 generate 节点 |
 | 反馈闭环 | `FEEDBACK_ENABLED=1` | `/api/feedback` + `/api/feedback/summary`，SQLite 事务写入，**只存问题哈希不存原文** |
+| 检索鲁棒性 | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | 融合保底防止"最佳项离群→只剩 1 条→必然拒答"；RRF 先过滤再排名，单域检索不再被摊薄；重排只取前 N 条候选 |
+| 成本闸门 | `MAX_TOKENS_PER_REQUEST` | 反思除轮次上限外，再加 token 预算与"本轮零新增证据"早停，避免枯竭查询空转 |
+| 外部重排熔断 | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | 批量请求（不再逐文档发 HTTP）+ 实例级熔断，失败不改写全局配置 |
 
-实测：`python -m unittest discover -s tests -t .` 42 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
+实测：`python -m unittest discover -s tests -t .` 56 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
 
 仍属 Demo 范畴、没有假装完成的部分：真实语料与版本过滤、token 级流式、多实例共享检查点/指标/反馈（当前是进程内）、
 速率限制与鉴权（当前只有并发上限）。这些需要外部资源，代码留了接口但没有虚构实现。

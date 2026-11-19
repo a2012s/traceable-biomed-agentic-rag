@@ -18,6 +18,10 @@ from ..config import ROOT, get_settings
 logger = logging.getLogger(__name__)
 
 
+class IndexRebuildRequired(RuntimeError):
+    """维度冲突且未授权重建：必须让人确认，不能被降级兜底静默吞掉。"""
+
+
 class VectorStore:
     dim: int
     name: str
@@ -42,11 +46,21 @@ class NumpyVectorStore(VectorStore):
         self._matrix: np.ndarray | None = None
 
     def upsert(self, ids: list[str], vectors: list[list[float]], payloads: list[dict]) -> None:
-        self._ids = list(ids)
-        self._matrix = np.asarray(vectors, dtype=np.float32)
+        """真正的 upsert 语义：按 id 覆盖/新增，未提及的旧项保留。
+
+        早期实现是整体替换 `_ids = ids`，调用方以为是追加，实际把旧文档全丢了——
+        增量更新语料时会静默删库。
+        """
+        rows: dict[str, np.ndarray] = {}
+        if self._matrix is not None:
+            rows = dict(zip(self._ids, self._matrix, strict=True))
+        for id_, vec in zip(ids, vectors, strict=True):
+            rows[id_] = np.asarray(vec, dtype=np.float32)
+        self._ids = list(rows)
+        matrix = np.asarray(list(rows.values()), dtype=np.float32)
         # 余弦：预归一化，检索时点积即可
-        norms = np.linalg.norm(self._matrix, axis=1, keepdims=True)
-        self._matrix = self._matrix / np.where(norms == 0, 1.0, norms)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        self._matrix = matrix / np.where(norms == 0, 1.0, norms)
 
     def search(self, vector: list[float], top_k: int) -> list[tuple[str, float]]:
         if self._matrix is None:
@@ -54,8 +68,11 @@ class NumpyVectorStore(VectorStore):
         q = np.asarray(vector, dtype=np.float32)
         norm = float(np.linalg.norm(q)) or 1.0
         scores = self._matrix @ (q / norm)
-        order = np.argsort(-scores)[:top_k]
-        return [(self._ids[i], float(scores[i])) for i in order if scores[i] > 0]
+        # 只需前 top_k 个：argpartition 是 O(N)，全排序是 O(N log N)
+        k = min(top_k, len(scores))
+        part = np.argpartition(-scores, k - 1)[:k] if k > 0 else []
+        order = part[np.argsort(-scores[part])]
+        return [(self._ids[int(i)], float(scores[i])) for i in order if scores[i] > 0]
 
     def count(self) -> int:
         return len(self._ids)
@@ -88,7 +105,14 @@ class QdrantLocal(VectorStore):
             existing = self.client.get_collection(collection_name=collection)
             existing_size = existing.config.params.vectors.size
             if existing_size != dim:
-                # embedding 后端切换导致维度变化：重建集合，避免检索时静默降级
+                # 维度变化通常意味着换了 embedding 模型。直接删除会静默毁掉整个索引，
+                # 必须由显式配置授权；否则宁可失败，让人先确认这是预期行为。
+                if not get_settings().allow_reindex:
+                    raise IndexRebuildRequired(
+                        f"向量集合维度冲突：已有 {existing_size}，当前 {dim}。"
+                        f"确认要重建索引请设置 ALLOW_REINDEX=1。"
+                    )
+                logger.warning("维度变化 %s -> %s，按 ALLOW_REINDEX 重建集合", existing_size, dim)
                 self.client.delete_collection(collection_name=collection)
         if dim and not self.client.collection_exists(collection):
             self.client.create_collection(
@@ -145,6 +169,9 @@ def build_store(dim: int, collection: str = "biomedical") -> VectorStore:
     if s.vector_store.lower() == "qdrant":
         try:
             return QdrantLocal(collection=collection, dim=dim)
+        except IndexRebuildRequired:
+            # 配置冲突要人确认，不能走"内存模式兜底"——那等于换了个空索引继续跑
+            raise
         except ImportError as exc:
             logger.warning("Qdrant 未安装(%s)，降级 numpy", exc)
         except Exception as exc:  # noqa: BLE001 - 锁冲突等运行时问题用内存模式兜底

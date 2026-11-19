@@ -46,8 +46,11 @@ def _verbose(entry: TraceEntry) -> None:
 
 async def orchestrator(state: AgentState) -> dict:
     start = time.perf_counter()
-    raw = get_llm().invoke(
-        ORCHESTRATE_SYSTEM, state["question"], mock_key=f"orchestrate|{state['question']}"
+    # to_thread：invoke 内部是同步 HTTP，直接调用会阻塞整个事件循环，
+    # Web 层的 Semaphore 限并发随之退化为 1（多请求排队等一个同步调用）
+    raw = await asyncio.to_thread(
+        get_llm().invoke,
+        ORCHESTRATE_SYSTEM, state["question"], mock_key=f"orchestrate|{state['question']}",
     )
     result = parse_json_loose(raw.content)
     agents = [a for a in result.get("agents", []) if a in AGENT_NAMES] or ["literature", "kg"]
@@ -70,7 +73,8 @@ async def query_rewriter(state: AgentState) -> dict:
     start = time.perf_counter()
     focus_hint = f"\n上一轮反思意见：{state.get('query_focus', '')}" if state.get("query_focus") else ""
     # 重写属于抽取类任务，路由到便宜模型；未配置 cheap_model 时自动复用主模型
-    result, raw = get_llm().json_invoke(
+    result, raw = await asyncio.to_thread(
+        get_llm().json_invoke,
         REWRITE_SYSTEM,
         state["question"] + focus_hint,
         mock_key=f"rewrite|{state['question']}{focus_hint}",
@@ -117,13 +121,20 @@ def make_domain_agent(
         )
 
         if isinstance(candidates, BaseException):
-            candidates = get_retriever().retrieve(queries, settings.retrieve_top_k, sources)
+            candidates = await asyncio.to_thread(
+                get_retriever().retrieve, queries, settings.retrieve_top_k, sources
+            )
         if isinstance(tool_result, BaseException):
             # 不可恢复错误（FatalToolError）与可恢复错误耗尽重试，都只降级本工具，不中断整条流程
             tool_result = None
 
-        # 检索用重写后的多条查询（放宽召回），打分只用「原问题 + 缩写展开」（收紧精度）
-        ranked: list[Evidence] = get_reranker().rerank(tool_params.expanded_query(state["question"]), candidates)
+        # 检索用重写后的多条查询（放宽召回），打分只用「原问题 + 缩写展开」（收紧精度）。
+        # 注意：expanded_query 只做语境义项替换，绝不能用重写器输出打分——
+        # 那里含 "systematic review" 这类通用词，会让任何文档都"相关"（假 grounded）。
+        # rerank 内有同步计算与可能的外部 HTTP，同样不能占用事件循环。
+        ranked: list[Evidence] = await asyncio.to_thread(
+            get_reranker().rerank, tool_params.expanded_query(state["question"]), candidates
+        )
         # 专家节点只做检索与工具调用，不调用 LLM —— token 消耗为 0
         entry = _trace(
             name, "retrieve+rerank",
@@ -156,13 +167,25 @@ async def fuse(state: AgentState) -> dict:
     start = time.perf_counter()
     candidates: list[Evidence] = state.get("candidates", [])
     fused = get_reranker().fuse(candidates, top_k=get_settings().evidence_top_k)
+    # 记录本轮新增了多少条上一轮没有的证据：一条都没有说明这条查询已经检索枯竭，
+    # 再反思一轮只是把同样的检索和生成成本再付一遍。
+    prev_ids = set(state.get("fused_ids") or [])
+    cur_ids = [e["doc_id"] for e in fused]
+    new_count = len(set(cur_ids) - prev_ids)
     entry = _trace(
         "fuse", "cross-domain-fuse",
-        f"候选 {len(candidates)} 条（{len({e['source'] for e in candidates})} 个数据域）→ 全局保留 {len(fused)} 条",
+        f"候选 {len(candidates)} 条（{len({e['source'] for e in candidates})} 个数据域）→ "
+        f"全局保留 {len(fused)} 条（新增 {new_count}）",
         start, 0,
     )
     _verbose(entry)
-    return {"evidences": fused, "traces": [entry], "token_usage": {"fuse": 0}}
+    return {
+        "evidences": fused,
+        "fused_ids": cur_ids,
+        "new_evidence_last_round": new_count,
+        "traces": [entry],
+        "token_usage": {"fuse": 0},
+    }
 
 
 async def critic(state: AgentState) -> dict:
@@ -206,23 +229,30 @@ async def generate(state: AgentState) -> dict:
     start = time.perf_counter()
     llm = get_llm()
     evidences: list[Evidence] = state.get("evidences", [])
+    # 白名单必须严格等于「实际送进 prompt 的集合」。取全部 evidences 会让模型
+    # 猜中第 9 条 doc_id 时也能通过校验——证据标签格式很规整，容易被模式化生成。
+    top_n = max(1, get_settings().evidence_top_k)
+    prompt_evidences = evidences[:top_n]
     blocks = "\n".join(
         f"[{e['doc_id']}] ({e['source']}, level {e['evidence_level']}) {e['title']}: {e['snippet']}"
-        for e in evidences[:8]
+        for e in prompt_evidences
     )
     caveat = "" if state.get("grounded") else "\n注意：当前证据不足，以下结论仅供参考。"
     user = f"问题：{state['question']}\n\n证据：\n{blocks}{caveat}"
-    valid_ids = {e["doc_id"] for e in evidences}
+    valid_ids = {e["doc_id"] for e in prompt_evidences}
+    citation_limit = min(4, len(prompt_evidences))
     if llm.is_mock:
         # Mock 模式：直接用可追溯的拼装答案，保证引用真实存在
-        answer = _fallback_answer(state, evidences)
-        citations = [e["doc_id"] for e in evidences[:4]]
+        answer = _fallback_answer(state, prompt_evidences)
+        citations = [e["doc_id"] for e in prompt_evidences[:citation_limit]]
         answer_tokens = 0  # 本地拼装，不调用 LLM
     else:
-        result, raw = llm.json_invoke(ANSWER_SYSTEM, user, tier="strong", return_meta=True)
+        result, raw = await asyncio.to_thread(
+            llm.json_invoke, ANSWER_SYSTEM, user, tier="strong", return_meta=True
+        )
         # 真实 LLM 返回引用后校验合法性，防幻觉引用
-        citations = [c for c in result.get("citations", []) if c in valid_ids]
-        answer = result.get("answer") or _fallback_answer(state, evidences)
+        citations = [c for c in result.get("citations", []) if c in valid_ids][:citation_limit]
+        answer = result.get("answer") or _fallback_answer(state, prompt_evidences)
         answer_tokens = raw.tokens
     final = f"{answer}\n\n证据来源：{', '.join(citations) if citations else '未找到可引用证据'}"
     entry = _trace("generate", "answer", f"生成 {len(answer)} 字，有效引用 {len(citations)} 条", start, answer_tokens)

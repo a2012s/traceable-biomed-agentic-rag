@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)](tests)
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
 [中文文档](README.md)
@@ -34,7 +34,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "What is the diagnostic criteria for MS?"
 python eval.py                                  # retrieval evaluation, seconds, no tokens burned
-python -m unittest discover -s tests -t .       # 42 unit / behavior tests
+python -m unittest discover -s tests -t .       # 56 unit / behavior tests
 ```
 
 `pip` works too: `pip install -e ".[real-vector]"`.
@@ -191,7 +191,7 @@ Honest labeling beats looking complete — stating real boundaries lets users ju
 | Three-way recall + RRF + re-ranking + evidence window | ✅ Real algorithms (re-ranking is feature scoring, not a neural model) |
 | Qdrant local HNSW / numpy fallback / index rebuild on dimension change | ✅ Real implementation |
 | TF-IDF embedding | ✅ Real computation (offline, not a semantic model) |
-| hash embedding | ⚠️ Fallback, explicitly marked as semantically weak |
+| hash embedding | ⚠️ Fallback, semantically weak; crc32 projection makes it reproducible across processes (not randomized `hash()`) |
 | Cross-encoder re-ranking | ⚠️ Simulated with IDF-weighted cosine + priors; swap `score()` for bge-reranker |
 | Four biomedical tools | ⚠️ Backed by local corpus; replace `pubmed_search` etc. with real APIs |
 | Critic | ⚠️ Rule-based (interpretable, zero cost), not an LLM judge |
@@ -216,8 +216,11 @@ offline demo is unaffected. Configuration keys are in `.env.example`.
 | External re-ranking | `RERANKER_API_URL` | POST `{query,text}` → `{score}` to a real cross-encoder; failures trip a circuit breaker and fall back to built-in scoring |
 | Streaming endpoint | On by default | `POST /api/ask/stream` (SSE); currently one frame per completed pipeline — token-level requires changes to the generate node |
 | Feedback loop | `FEEDBACK_ENABLED=1` | `/api/feedback` + `/api/feedback/summary`, transactional SQLite writes, **question hashes only, never raw text** |
+| Retrieval robustness | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | Fusion floor prevents "outlier best score → single evidence → guaranteed refusal"; RRF filters by domain before assigning ranks; re-ranking only sees the top N candidates |
+| Cost gate | `MAX_TOKENS_PER_REQUEST` | Beyond the iteration cap, reflection also stops on a token budget or on zero new evidence, so exhausted queries don't spin |
+| Re-ranker circuit breaker | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | Batched request (no per-document HTTP) + instance-level breaker that never mutates global config |
 
-Measured: `python -m unittest discover -s tests -t .` passes 42 tests; `python eval.py` and
+Measured: `python -m unittest discover -s tests -t .` passes 56 tests; `python eval.py` and
 `python eval.py --full` show no metric regression.
 
 Still demo-scope and not claimed as done: real corpus and version filtering, token-level streaming,

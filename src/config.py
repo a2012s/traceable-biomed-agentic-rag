@@ -39,9 +39,22 @@ class Settings(BaseSettings):
 
     rerank_top_k: int = 5
     retrieve_top_k: int = 50
+    # 送入重排的候选上限：Top-50 与 Top-20 重排延迟差数倍，接入真 cross-encoder 后尤其明显
+    rerank_candidates: int = 20
     # 跨域融合后送入生成节点的证据条数：太少丢多源证据，太多稀释注意力
     evidence_top_k: int = 8
+    # 融合截断：保留最佳分数的 fuse_margin 倍以上，但至少留 fuse_min_keep 条。
+    # 缺保底时，最佳项是离群值会把其余高质量证据全部丢掉，只剩 1 条导致 Critic
+    # 的「独立数据源 ≥2」必然不成立 → 跑满反思仍拒答。
+    # 默认 2：消除"只剩 1 条"的结构性拒答，且不额外引入低分证据；
+    # 调大能进一步兜底多源要求，但会把边缘证据送进 prompt，按语料实测取舍。
+    fuse_margin: float = 0.5
+    fuse_min_keep: int = 2
+    # RRF 平滑常数：越大越弱化名次差异，60 是工业界常用默认值
+    rrf_k: int = 60
     max_reflections: int = 2
+    # 单请求 token 预算：超过即停止反思，避免证据枯竭的查询空转烧钱
+    max_tokens_per_request: int = 20000
     # 召回优先：默认全量并行召回四个数据域，编排器只在明确无关时裁剪。
     # 设为 0 则完全由编排器按领域裁剪 —— 实测会掉召回（见 README 的消融数据）。
     wide_recall: int = 1
@@ -60,6 +73,15 @@ class Settings(BaseSettings):
     # 外部 cross-encoder 重排端点；留空则用内置 IDF 加权余弦
     reranker_api_url: str = ""
     reranker_api_key: str = ""
+    # 单次外部重排请求超时（秒）与熔断冷却（秒）
+    reranker_timeout_s: float = 3.0
+    reranker_breaker_cooldown_s: float = 60.0
+    # api embedding 批大小：一次送全部文本会撞上单请求条数/字节上限
+    embedding_batch_size: int = 64
+    # 1=embedding API 失败直接报错，不静默降级（生产建议开，避免质量悄悄劣化）
+    embedding_strict: int = 0
+    # 1=允许向量集合维度变化时自动重建；默认 0，避免改一行配置就静默删索引
+    allow_reindex: int = 0
     # 1=启用实体链接消歧（默认开，纯规则无网络）
     entity_linking: int = 1
     # 反馈闭环：默认关闭；开启后写本地 SQLite，生产多实例替换为共享 DB

@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 import urllib.error
 import urllib.request
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -46,7 +48,10 @@ class HashEmbedding(EmbeddingBackend):
         for text in texts:
             vec = np.zeros(self.dim, dtype=np.float32)
             for tok in tokenize(text):
-                vec[hash(tok) % self.dim] += 1.0
+                # 用 crc32 而不是内置 hash()：str 的 hash 受 PYTHONHASHSEED 随机化，
+                # 同一文本在不同进程会被投影到不同维度。索引一旦落盘，跨进程检索
+                # 就会静默退化为随机结果——这是最难排查的一类 bug。
+                vec[zlib.crc32(tok.encode("utf-8")) % self.dim] += 1.0
             norm = float(np.linalg.norm(vec)) or 1.0
             out.append((vec / norm).tolist())
         return out
@@ -105,8 +110,11 @@ class APIEmbedding(EmbeddingBackend):
     model: str = ""
     base_url: str = ""
     api_key: str = ""
+    batch_size: int = 64
+    timeout_s: float = 45.0
+    _dim_observed: bool = False
 
-    def encode(self, texts: list[str]) -> list[list[float]]:
+    def _post(self, texts: list[str], attempt: int = 0) -> list[list[float]]:
         payload = {"model": self.model, "input": texts}
         req = urllib.request.Request(
             f"{self.base_url.rstrip('/')}/embeddings",
@@ -118,18 +126,42 @@ class APIEmbedding(EmbeddingBackend):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")[:200]
+            # 429/5xx 是瞬时过载，退避重试；4xx（除 429）是参数或授权错误，重试无意义
+            if (exc.code == 429 or exc.code >= 500) and attempt < 2:
+                time.sleep(0.5 * (2**attempt))
+                return self._post(texts, attempt + 1)
             raise RuntimeError(f"embedding API HTTP {exc.code}: {detail}") from exc
-        vectors = [item["embedding"] for item in sorted(body["data"], key=lambda x: x["index"])]
-        self.dim = len(vectors[0]) if vectors else self.dim
-        return vectors
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < 2:
+                time.sleep(0.5 * (2**attempt))
+                return self._post(texts, attempt + 1)
+            raise RuntimeError(f"embedding API 不可达: {exc}") from exc
+        return [item["embedding"] for item in sorted(body["data"], key=lambda x: x["index"])]
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        out: list[list[float]] = []
+        size = max(1, self.batch_size)
+        for start in range(0, len(texts), size):
+            out.extend(self._post(texts[start : start + size]))
+        dim = len(out[0])
+        if not self._dim_observed:
+            # 首次以真实返回为准：模型维度与默认值不同不算错，否则换模型必炸
+            self.dim = dim
+            self._dim_observed = True
+        elif dim != self.dim:
+            # 同一进程内维度漂移说明后端被切换或代理返回了异构结果，必须立即失败
+            raise ValueError(f"embedding 维度不一致：已观测 {self.dim}，本次 {dim}")
+        return out
 
 
 def build_embedding(corpus_texts: list[str]) -> EmbeddingBackend:
-    """按配置构造后端；api 失败时自动降级到 tfidf，保证 demo 不中断。"""
+    """按配置构造后端；api 失败时默认降级 tfidf，严格模式下直接失败。"""
     s = get_settings()
     backend = s.embedding_backend.lower()
     if backend == "hash":
@@ -140,9 +172,14 @@ def build_embedding(corpus_texts: list[str]) -> EmbeddingBackend:
                 model=s.embedding_model,
                 base_url=s.active_base_url,
                 api_key=s.active_api_key,
+                batch_size=s.embedding_batch_size,
             )
-            emb.encode(["connectivity probe"])  # 提前探测，失败即降级
+            emb.encode(["connectivity probe"])  # 提前探测并确定真实维度
             return emb
         except Exception as exc:  # noqa: BLE001 - 降级是刻意设计
+            # 生产开 EMBEDDING_STRICT 时不要静默换后端：检索质量劣化不会体现在
+            # 任何指标上，只会表现为"最近回答变差了"。
+            if s.embedding_strict:
+                raise RuntimeError(f"embedding API 不可用且已开启严格模式: {exc}") from exc
             logger.warning("embedding API 不可用(%s)，自动降级 tfidf", exc)
     return TFIDFEmbedding().fit(corpus_texts)

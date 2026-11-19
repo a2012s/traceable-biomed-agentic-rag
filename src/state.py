@@ -8,8 +8,6 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
-RESET_SENTINEL = "__reset__"  # 已废弃：反思回流改为「去重累积」，保留常量避免外部引用报错
-
 
 def merge_dict(left: dict | None, right: dict | None) -> dict:
     out = dict(left or {})
@@ -71,6 +69,10 @@ class AgentState(TypedDict, total=False):
     # evidences:  跨域融合后的最终证据（覆盖语义，只有融合节点写）
     candidates: Annotated[list[Evidence], merge_evidences]
     evidences: list[Evidence]
+    # 融合节点每轮覆盖写入：上一轮保留的 doc_id 与"本轮新增条数"。
+    # 新增为 0 说明检索已枯竭，反思再跑一轮只是重复付费。
+    fused_ids: list[str]
+    new_evidence_last_round: int
     traces: Annotated[list[TraceEntry], operator.add]
     token_usage: Annotated[dict[str, int], merge_dict]
     critique: str

@@ -1,5 +1,9 @@
 """集中管理提示词，便于迭代与评估。"""
 
+# 提示词版本：参与答案缓存键。改了下面任何 SYSTEM 提示都必须递增，
+# 否则 TTL 内会继续返回按旧提示生成的答案（迭代期极难察觉）。
+PROMPT_VERSION = "v1"
+
 ORCHESTRATE_SYSTEM = """You are the orchestrator of a biomedical research assistant.
 Decide which specialist agents are needed. You MUST choose agents ONLY from this exact set:
 ["literature", "clinical", "report", "kg"]

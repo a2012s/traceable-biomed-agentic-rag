@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 
 if os.environ.get("WEB_ALLOW_REAL_LLM", "0") != "1":
@@ -80,6 +81,15 @@ def _mode() -> str:
 
 
 _semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
+
+# 只接受字母数字与短横线：客户端传来的 id 会回显到响应头与日志，
+# 不校验就等于开放日志注入/响应头注入（换行符、控制字符、超长串）。
+_REQ_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+def _request_id(request: Request) -> str:
+    incoming = request.headers.get("x-request-id", "")
+    return incoming if _REQ_ID_RE.match(incoming) else metrics.new_request_id()
 
 
 async def _execute(question: str, thread_id: str | None) -> dict:
@@ -168,7 +178,7 @@ async def feedback_summary() -> dict:
 @app.post("/api/ask")
 async def ask(req: AskRequest, request: Request) -> JSONResponse:
     """跑一次完整问答，返回决策链 + 证据 + 答案。"""
-    request_id = request.headers.get("x-request-id") or metrics.new_request_id()
+    request_id = _request_id(request)
     started = time.perf_counter()
     metrics.start()
     ok = False
@@ -193,7 +203,7 @@ async def ask_stream(req: AskRequest, request: Request) -> StreamingResponse:
     「链路完成」这一帧；token 级流式需把 generate 节点改成 stream 客户端，
     属于后续改造，不在本次范围。保留 SSE 端点是为了前端接入方式与生产一致。
     """
-    request_id = request.headers.get("x-request-id") or metrics.new_request_id()
+    request_id = _request_id(request)
     started = time.perf_counter()
     metrics.start()
 

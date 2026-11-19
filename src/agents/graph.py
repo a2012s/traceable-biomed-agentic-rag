@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from functools import lru_cache
 
@@ -17,6 +18,7 @@ from ..state import AgentState
 from . import nodes
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 AGENT_NAMES = list(nodes.AGENT_NAMES)
 AGENT_FUNCS = {
@@ -38,11 +40,25 @@ def route_to_agents(state: AgentState) -> list[str]:
 
 
 def after_critique(state: AgentState) -> str:
+    """反思是否继续：三道闸，缺一道都会让成本或延迟失控。
+
+    1. 证据已充分 → 直接生成；
+    2. 轮次上限 → 防止死循环（原有）；
+    3. token 预算 → 每轮都是一次完整检索 + 生成，没有预算上限时成本不可控；
+    4. 本轮零新增证据 → 检索已枯竭，再跑一轮结果不变、成本翻倍。
+    """
     if state.get("grounded"):
         return "generate"
-    if state.get("reflection_count", 0) < settings.max_reflections:
-        return "rewrite_again"
-    return "generate"
+    if state.get("reflection_count", 0) >= settings.max_reflections:
+        return "generate"
+    spent = sum(int(v) for v in (state.get("token_usage") or {}).values())
+    if spent >= settings.max_tokens_per_request:
+        logger.debug("token 预算耗尽（%s），停止反思", spent)
+        return "generate"
+    if state.get("new_evidence_last_round", 0) == 0:
+        logger.debug("本轮无新增有效证据，停止反思")
+        return "generate"
+    return "rewrite_again"
 
 
 def increment_reflection(state: AgentState) -> dict:

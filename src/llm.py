@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from .config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class UnrecoverableLLMError(Exception):
@@ -33,7 +36,8 @@ class LLMClient:
     """按任务复杂度路由到强/弱模型；Mock 模式下所有调用本地规则生成。"""
 
     settings: object = field(default_factory=get_settings)
-    _call_count: int = field(default=0, init=False)
+    _call_count: int = field(default=0, init=False)      # 逻辑调用数（含 mock）
+    _http_calls: int = field(default=0, init=False)      # 真实 HTTP 次数（含重试）
 
     @property
     def is_mock(self) -> bool:
@@ -61,8 +65,12 @@ class LLMClient:
             tokens = self.estimate_tokens(system + user) + self.estimate_tokens(content)
         else:
             content, usage = self._call_api(system, user, model)
-            # 用 API 返回的真实 token 数，推理模型的 reasoning_tokens 计入成本
-            tokens = usage.get("total_tokens") or usage.get("completion_tokens", 0)
+            # 用 API 返回的真实 token 数，推理模型的 reasoning_tokens 计入成本。
+            # 不能写成 total_tokens or completion_tokens：部分兼容端点把 total_tokens
+            # 返回 0，or 会 fallthrough 到 completion，把 prompt 的消耗整段漏掉。
+            tokens = (
+                usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            ) or usage.get("total_tokens", 0)
         elapsed = (time.perf_counter() - start) * 1000
         return LLMResponse(
             content=content,
@@ -91,10 +99,14 @@ class LLMClient:
     @retry(
         retry=retry_if_exception_type((urllib.error.URLError, TimeoutError)),
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, max=4),
+        # 带抖动：并发 429 时固定退避会让所有请求同步重试，形成尖峰再被限流
+        wait=wait_exponential_jitter(initial=0.5, max=4, jitter=0.5),
         reraise=True,
     )
     def _call_api(self, system: str, user: str, model: str) -> tuple[str, dict]:
+        return self._post(system, user, model, use_format=True)
+
+    def _post(self, system: str, user: str, model: str, *, use_format: bool) -> tuple[str, dict]:
         s = self.settings
         payload = {
             "model": model,
@@ -103,8 +115,9 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
         }
+        if use_format:
+            payload["response_format"] = {"type": "json_object"}
         req = urllib.request.Request(
             f"{s.active_base_url.rstrip('/')}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -114,11 +127,17 @@ class LLMClient:
             },
             method="POST",
         )
+        self._http_calls += 1
         try:
             with urllib.request.urlopen(req, timeout=45) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            # 部分 OpenAI 兼容端点不支持 response_format，会以 400 拒绝。
+            # 这不是参数错误，去掉该字段重试一次即可；否则该 provider 永久不可用。
+            if exc.code == 400 and use_format and ("response_format" in detail or "json_object" in detail):
+                logger.warning("provider 不支持 response_format，改为提示词约束 JSON 输出")
+                return self._post(system, user, model, use_format=False)
             if exc.code in (401, 403, 400, 404):
                 raise UnrecoverableLLMError(f"HTTP {exc.code}: {detail}") from exc
             raise  # 429 / 5xx 交给 tenacity 重试
