@@ -160,8 +160,8 @@ distractor leakage unchanged — tool calls contribute to the answer, not just t
 ```
 src/
 ├─ agents/
-│  ├─ graph.py        state machine: conditional edges, fan-out, reflection, HITL interrupt, checkpointer
-│  ├─ nodes.py        orchestrator / rewriter / tool use / domain agents (factory) / fusion / critic / review / generate
+│  ├─ graph.py        state machine: conditional edges, fan-out / fan-in, reflection, HITL interrupt, checkpointer
+│  ├─ nodes.py        orchestrator / rewriter / tool use / domain agents (factory) / fusion / critic / review / refuse / generate
 │  ├─ prompts.py      centralized prompts for iteration and evaluation
 │  └─ tool_params.py  tool argument extraction: query ∩ corpus vocabulary, no hardcoded domain nouns
 ├─ rag/
@@ -236,7 +236,7 @@ offline demo is unaffected. Configuration keys are in `.env.example`.
 | Observability | On by default | `X-Request-ID` spans headers and body; `/api/metrics` reports request counts, errors, P50/P95/P99, cache hit rate |
 | Answer cache | `ANSWER_CACHE_TTL_S` | Key includes corpus digest, embedding/retrieval config, and model tier — a config change can't serve a stale answer |
 | Entity linking | `ENTITY_LINKING=1` | `eGFR` (kidney function) and `EGFR` (gene) are homographs; the alternate sense is down-weighted, not hard-deleted; end-to-end leakage 0.153 → 0.083 |
-| External re-ranking | `RERANKER_API_URL` | POST `{query,text}` → `{score}` to a real cross-encoder; failures trip a circuit breaker and fall back to built-in scoring |
+| External re-ranking | `RERANKER_API_URL` | Batched POST `{query, texts}` → `{scores}` to a real cross-encoder (single `{query, text}` endpoints still supported); failures trip a circuit breaker and fall back to built-in scoring |
 | Streaming endpoint | On by default | `POST /api/ask/stream` (SSE); currently one frame per completed pipeline — token-level requires changes to the generate node |
 | Feedback loop | `FEEDBACK_ENABLED=1` | `/api/feedback` + `/api/feedback/summary`, transactional SQLite writes, **question hashes only, never raw text** |
 | Retrieval robustness | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | Fusion floor prevents "outlier best score → single evidence → guaranteed refusal"; RRF filters by domain before assigning ranks; re-ranking only sees the top N candidates |
@@ -299,6 +299,8 @@ state (evidence tagged with branch/tag, Critic filtering cross-version evidence)
   paraphrase queries still need `EMBEDDING_BACKEND=api`
 - The HITL pause lives in the checkpointer: with `CHECKPOINTER=memory` (default) it is lost on
   restart and not shared across workers — production needs `sqlite`/Redis for reviews to survive
+- With `HITL_ENABLED=1` the answer cache is neither read nor written (a cache hit would skip the
+  graph entirely and the review step would never fire), so every request pays a full pipeline run
 
 ## 10. Five Core Design Takeaways
 

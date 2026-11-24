@@ -146,8 +146,8 @@ LLM 自主工具选择（默认开，`TOOL_USE_ENABLED=0` 可关）让工具返�
 ```
 src/
 ├─ agents/
-│  ├─ graph.py        状态机：条件边、并行 fan-out、反思回流、HITL 断点、checkpointer
-│  ├─ nodes.py        编排 / 重写 / 工具选择 / 四域 agent（工厂）/ 融合 / 反思 / 人工确认 / 生成
+│  ├─ graph.py        状态机：条件边、并行 fan-out / fan-in 汇聚、反思回流、HITL 断点、checkpointer
+│  ├─ nodes.py        编排 / 重写 / 工具选择 / 四域 agent（工厂）/ 融合 / 反思 / 人工确认 / 拒答 / 生成
 │  ├─ prompts.py      提示词集中管理，便于迭代与评估
 │  └─ tool_params.py  工具入参抽取：查询 ∩ 语料词表，不硬编码领域名词
 ├─ rag/
@@ -220,7 +220,7 @@ web/
 | 可观测性 | 默认开 | `X-Request-ID` 贯穿响应头与响应体；`/api/metrics` 给出请求数、错误数、P50/P95/P99、缓存命中率 |
 | 答案缓存 | `ANSWER_CACHE_TTL_S` | 键含语料版本摘要、embedding/检索配置、模型档位；换配置不会吃到旧答案 |
 | 实体链接 | `ENTITY_LINKING=1` | `eGFR`（肾功能）与 `EGFR`（基因）同形异义，对另一义项证据降权而非硬删；端到端干扰泄漏 0.153 → 0.083 |
-| 外部重排 | `RERANKER_API_URL` | POST `{query,text}` → `{score}`，接真 cross-encoder；失败熔断降级内置打分 |
+| 外部重排 | `RERANKER_API_URL` | 批量 POST `{query, texts}` → `{scores}`，接真 cross-encoder（单条 `{query, text}` 端点仍兼容）；失败熔断降级内置打分 |
 | 流式接口 | 默认开 | `POST /api/ask/stream` SSE；当前推送粒度为整条链路完成，token 级需改 generate 节点 |
 | 反馈闭环 | `FEEDBACK_ENABLED=1` | `/api/feedback` + `/api/feedback/summary`，SQLite 事务写入，**只存问题哈希不存原文** |
 | 检索鲁棒性 | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | 融合保底防止"最佳项离群→只剩 1 条→必然拒答"；RRF 先过滤再排名，单域检索不再被摊薄；重排只取前 N 条候选 |
@@ -272,6 +272,8 @@ AST 级切分（tree-sitter，别按字符切坏函数）、符号索引与调�
   `eGFR`（肾功能）与 `EGFR`（基因）在更复杂语境下仍可能残留同形误召回
 - 人工确认的断点存在 checkpointer 里：`CHECKPOINTER=memory`（默认）时进程重启即丢失、多 worker 也不共享，
   生产要配 `sqlite`/Redis 才能让人工确认跨重启存活
+- 开启 `HITL_ENABLED=1` 时不读也不写答案缓存（否则命中缓存会整段跳过图，确认环节永远不触发），
+  等价于每次请求都完整跑一遍，延迟与成本按未命中计
 - Reranker 是 IDF 加权余弦模拟，不是真 cross-encoder；语义改写型查询仍需 `EMBEDDING_BACKEND=api`
 
 ## 10. 五个核心设计要点
