@@ -68,7 +68,12 @@ class AgentState(TypedDict, total=False):
     # candidates: 并行 agent 的原始召回（去重累积，供融合节点消费）
     # evidences:  跨域融合后的最终证据（覆盖语义，只有融合节点写）
     candidates: Annotated[list[Evidence], merge_evidences]
+    # 工具返回的原始文档（由 tool_use 节点写入，fuse 节点统一转成 Evidence 参与融合）
+    # 用 reducer 归并：并行节点都只追加，不互相覆盖
+    tool_docs: Annotated[list[dict], operator.add]
     evidences: list[Evidence]
+    # 会话历史：多轮对话时传入，query_rewriter 用它做指代消解
+    history: list[dict]
     # 融合节点每轮覆盖写入：上一轮保留的 doc_id 与"本轮新增条数"。
     # 新增为 0 说明检索已枯竭，反思再跑一轮只是重复付费。
     fused_ids: list[str]

@@ -14,10 +14,16 @@ from ..deps import get_llm, get_reranker, get_retriever
 from ..llm import parse_json_loose
 from ..logging_setup import TRACE_LOGGER
 from ..state import AgentState, Evidence, TraceEntry
-from ..tools.biomedical import dispatch
+from ..tools.biomedical import TOOL_SPECS, dispatch
 from ..utils.text import content_tokens
 from . import tool_params
-from .prompts import ANSWER_SYSTEM, ORCHESTRATE_SYSTEM, REWRITE_SYSTEM
+from .prompts import (
+    ANSWER_SYSTEM,
+    ORCHESTRATE_SYSTEM,
+    REWRITE_SYSTEM,
+    REWRITE_WITH_HISTORY_HINT,
+    TOOL_SELECT_SYSTEM,
+)
 
 settings = get_settings()
 trace_logger = logging.getLogger(TRACE_LOGGER)
@@ -72,12 +78,23 @@ async def orchestrator(state: AgentState) -> dict:
 async def query_rewriter(state: AgentState) -> dict:
     start = time.perf_counter()
     focus_hint = f"\n上一轮反思意见：{state.get('query_focus', '')}" if state.get("query_focus") else ""
+    # 多轮对话：把最近几轮 Q/A 作为指代消解上下文。
+    # 只送问题文本、不送上一轮证据全文——后者会把旧答案的引用带进新问题的检索，
+    # 造成「上一轮的证据污染下一轮」的隐性串联。
+    history = (state.get("history") or [])[-3:]
+    history_hint = ""
+    if history:
+        lines = [f"Q: {h.get('question', '')[:160]}  A: {h.get('answer', '')[:160]}" for h in history]
+        history_hint = REWRITE_WITH_HISTORY_HINT.format(history="\n".join(lines))
+    user_input = state["question"] + focus_hint + history_hint
     # 重写属于抽取类任务，路由到便宜模型；未配置 cheap_model 时自动复用主模型
     result, raw = await asyncio.to_thread(
         get_llm().json_invoke,
         REWRITE_SYSTEM,
-        state["question"] + focus_hint,
-        mock_key=f"rewrite|{state['question']}{focus_hint}",
+        user_input,
+        # mock_key 必须包含历史摘要：mock 的规则引擎靠 key 还原输入，
+        # 只传原问题会让指代消解在 mock 模式下完全失效（真实模型走 user_input 不受影响）。
+        mock_key=f"rewrite|{user_input}",
         tier="cheap",
         return_meta=True,
     )
@@ -96,6 +113,124 @@ async def query_rewriter(state: AgentState) -> dict:
         "traces": [entry],
         "token_usage": {"query_rewriter": raw.tokens},
     }
+
+
+def _tool_catalog() -> str:
+    """把注册表投影成 LLM 可读的工具清单（name + description + JSON Schema）。
+
+    从 TOOL_SPECS 实时生成而非手写字符串：新增工具时提示词自动跟上，
+    不会出现「加了工具但模型不知道」的两处维护问题。
+    """
+    lines = []
+    for spec in TOOL_SPECS:
+        schema = spec.schema.model_json_schema()
+        props = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        args = ", ".join(
+            f"{k}:{v.get('type', 'any')}{'*' if k in required else '?'}" for k, v in props.items()
+        )
+        lines.append(f"- {spec.name}({args}): {spec.description}")
+    return "\n".join(lines)
+
+
+def _normalize_tool_hits(result: object) -> list[dict]:
+    """把各工具异构返回统一成文档字典列表。
+
+    pubmed/report 返回 list[dict]；umls_expand 返回 {"kg_docs": [...]}。
+    这里做归一化，让证据转换逻辑不必知道每个工具的内部结构。
+    """
+    if isinstance(result, list):
+        return [r for r in result if isinstance(r, dict) and "doc_id" in r]
+    if isinstance(result, dict):
+        docs = result.get("kg_docs") or result.get("docs") or []
+        return [r for r in docs if isinstance(r, dict) and "doc_id" in r]
+    return []
+
+
+async def tool_use(state: AgentState) -> dict:
+    """LLM 自主工具选择节点：模型看 schema 决定调什么、传什么参数。
+
+    与四个「固定工具」的域 agent 互补：域 agent 保证每个数据源都被检索到（召回底线），
+    本节点让模型按问题语义额外调用工具，取其返回文档作为补充证据。
+    两者结果都进 candidates，由 fuse 统一去重融合。
+
+    关键工程点：
+    - 模型输出的参数必须过 Pydantic（dispatch 内校验），幻觉参数被拒绝而不是打到下游；
+    - 单个工具失败只降级该工具，不中断主流程；
+    - mock 模式用领域规则模拟选择，保证离线也能演示完整 tool-use 闭环。
+    """
+    if not get_settings().tool_use_enabled:
+        return {"tool_docs": [], "traces": [], "token_usage": {"tool_use": 0}}
+
+    start = time.perf_counter()
+    llm = get_llm()
+    user = f"Question: {state['question']}\n\nAvailable tools:\n{_tool_catalog()}"
+    if llm.is_mock:
+        decision = _mock_tool_select(state["question"])
+        tokens = 0
+    else:
+        result, raw = await asyncio.to_thread(
+            llm.json_invoke,
+            TOOL_SELECT_SYSTEM,
+            user,
+            mock_key="",
+            tier="cheap",
+            return_meta=True,
+        )
+        decision, tokens = result, raw.tokens
+
+    calls = decision.get("calls") or []
+    if not isinstance(calls, list):
+        calls = []
+    max_calls = max(0, get_settings().tool_use_max_calls)
+    calls = calls[:max_calls]
+
+    outcomes: list[str] = []
+    docs: list[dict] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            outcomes.append("invalid-call")
+            continue
+        name = str(call.get("name", ""))
+        args = call.get("arguments") or {}
+        if not isinstance(args, dict):
+            outcomes.append(f"{name}:bad-args")
+            continue
+        try:
+            hits = await dispatch(name, args)
+            normalized = _normalize_tool_hits(hits)
+            docs.extend(normalized)
+            outcomes.append(f"{name}:{len(normalized)}")
+        except Exception as exc:  # noqa: BLE001 - 工具失败要降级，不能炸掉整条链路
+            reasons = [type(exc).__name__, str(exc)[:60]]
+            outcomes.append(f"{name}:failed({'/'.join(reasons)})")
+
+    entry = _trace(
+        "tool_use", "select+dispatch",
+        f"LLM 选 {len(calls)} 个工具 → " + ", ".join(outcomes) if outcomes else "LLM 选 0 个工具",
+        start, tokens,
+    )
+    _verbose(entry)
+    return {
+        "tool_docs": docs,
+        "traces": [entry],
+        "token_usage": {"tool_use": tokens},
+    }
+
+
+def _mock_tool_select(question: str) -> dict:
+    """Mock 模式的工具选择：按问题里的领域信号映射，行为可预测、可测试。"""
+    q = question.lower()
+    calls = []
+    if "trial" in q or "nct" in q or "临床试验" in question or "试验" in question:
+        calls.append({"name": "clinicaltrials_lookup", "arguments": {"indication": "cancer"}})
+    if any(k in q for k in ("ms ", "缩写", "abbreviation", "egfr", "sglt2")):
+        calls.append({"name": "umls_expand", "arguments": {"concept": question[:40]}})
+    if any(k in q for k in ("report", "病理", "影像", "mri")):
+        calls.append({"name": "report_lookup", "arguments": {"keywords": ["mri"]}})
+    if not calls:
+        calls.append({"name": "umls_expand", "arguments": {"concept": question[:40]}})
+    return {"calls": calls}
 
 
 def make_domain_agent(
@@ -166,6 +301,28 @@ async def fuse(state: AgentState) -> dict:
     """
     start = time.perf_counter()
     candidates: list[Evidence] = state.get("candidates", [])
+    # 工具返回的文档转成与检索同构的 Evidence，走同一个 reranker 打分。
+    # 不这样做的话，工具调用就只是 trace 里的一行装饰，对答案没有任何实际贡献。
+    tool_docs = state.get("tool_docs") or []
+    if tool_docs:
+        from ..data.corpus import Document
+
+        docs = []
+        seen = set()
+        for d in tool_docs:
+            doc_id = d.get("doc_id", "")
+            if not doc_id or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            docs.append(Document(
+                doc_id=doc_id, source=d.get("source", "literature"), title=d.get("title", ""),
+                text=d.get("text", ""), url=d.get("url", ""), study_type=d.get("study_type", "narrative"),
+                evidence_level=d.get("evidence_level", "4"), year=int(d.get("year", 2023) or 2023),
+            ))
+        tool_evidence = await asyncio.to_thread(
+            get_reranker().rerank, tool_params.expanded_query(state["question"]), docs
+        )
+        candidates = [*candidates, *tool_evidence]
     fused = get_reranker().fuse(candidates, top_k=get_settings().evidence_top_k)
     # 记录本轮新增了多少条上一轮没有的证据：一条都没有说明这条查询已经检索枯竭，
     # 再反思一轮只是把同样的检索和生成成本再付一遍。

@@ -20,6 +20,17 @@ class GoldenCase:
     relevant: frozenset[str]
     distractors: frozenset[str] = field(default_factory=frozenset)
     note: str = ""
+    # dev 用于调参；test 只用于最终报告，不参与任何阈值/权重调整。
+    # n=12 时 test 仅 3 条，统计意义有限——切分是为了建立流程，不是为了给出显著结论。
+    split: str = "dev"
+
+
+# 固定留出的 holdout：按问题里的关键题型分散选取，避免全集中在同一数据域。
+_TEST_QUESTIONS = frozenset({
+    "MS 的诊断标准是什么？",
+    "dapagliflozin 在慢性肾脏病的肾脏终点试验结果",
+    "mass spectrometry 与 immunoassay 的检测通量对比",
+})
 
 
 GOLDEN_SET: list[GoldenCase] = [
@@ -95,6 +106,14 @@ GOLDEN_SET: list[GoldenCase] = [
         distractors=frozenset({"PMID:38112009", "UMLS:C0026769"}),
         note="与方法学问题的对照样本，检验 MS 消歧方向是否反了过来",
     ),
+]
+
+
+# 应用固定切分：不修改上面的样本定义，避免改一条就漏标 test
+GOLDEN_SET = [
+    case if case.question not in _TEST_QUESTIONS
+    else GoldenCase(**{**case.__dict__, "split": "test"})
+    for case in GOLDEN_SET
 ]
 
 

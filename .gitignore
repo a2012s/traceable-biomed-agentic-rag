@@ -9,4 +9,5 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+eval_runs/
 .DS_Store

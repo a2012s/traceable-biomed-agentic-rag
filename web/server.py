@@ -67,6 +67,8 @@ AGENT_LABELS = {
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     thread_id: str | None = Field(default=None, max_length=100)
+    # 多轮上下文：只传问题和答案文本，不传内部状态（避免旧证据污染新一轮）
+    history: list[dict] = Field(default_factory=list, max_length=10)
 
 
 class FeedbackRequest(BaseModel):
@@ -92,11 +94,11 @@ def _request_id(request: Request) -> str:
     return incoming if _REQ_ID_RE.match(incoming) else metrics.new_request_id()
 
 
-async def _execute(question: str, thread_id: str | None) -> dict:
+async def _execute(question: str, thread_id: str | None, history: list[dict] | None = None) -> dict:
     """带并发闸门与超时的链路执行。"""
     async with _semaphore:
         return await asyncio.wait_for(
-            run_graph(question.strip(), verbose=False, thread_id=thread_id),
+            run_graph(question.strip(), verbose=False, thread_id=thread_id, history=history),
             timeout=settings.request_timeout_s,
         )
 
@@ -183,7 +185,7 @@ async def ask(req: AskRequest, request: Request) -> JSONResponse:
     metrics.start()
     ok = False
     try:
-        state = await _execute(req.question, req.thread_id)
+        state = await _execute(req.question, req.thread_id, req.history)
         payload = _payload(state, request_id, (time.perf_counter() - started) * 1000)
         ok = True
         return JSONResponse(payload, headers={"X-Request-ID": request_id})
@@ -210,7 +212,7 @@ async def ask_stream(req: AskRequest, request: Request) -> StreamingResponse:
     async def events():
         ok = False
         try:
-            state = await _execute(req.question, req.thread_id)
+            state = await _execute(req.question, req.thread_id, req.history)
             payload = _payload(state, request_id, (time.perf_counter() - started) * 1000)
             yield f"event: result\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield "event: done\ndata: {}\n\n"

@@ -12,9 +12,37 @@
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 from .golden_set import GoldenCase
+
+
+def bootstrap_ci(
+    values: list[float], n: int = 2000, alpha: float = 0.05, seed: int = 42
+) -> tuple[float, float]:
+    """有放回重采样给出均值的 (1-alpha) 置信区间。
+
+    固定 seed 保证同一批结果每次得到相同区间——评估报告必须可复现，
+    否则「区间变窄了」可能只是随机数换了一次。
+
+    注意 n=12 时区间会非常宽，这是诚实的：小样本上 0.910 vs 0.972 的差异
+    完全可能是噪声。不要拿它当显著性检验，只用它标注点估计的不确定性。
+    """
+    if not values:
+        return 0.0, 0.0
+    if len(values) == 1:
+        return values[0], values[0]
+    rng = random.Random(seed)
+    k = len(values)
+    means = []
+    for _ in range(n):
+        sample = [values[rng.randrange(k)] for _ in range(k)]
+        means.append(sum(sample) / k)
+    means.sort()
+    lo = means[int(len(means) * alpha / 2)]
+    hi = means[min(len(means) - 1, int(len(means) * (1 - alpha / 2)))]
+    return round(lo, 3), round(hi, 3)
 
 
 @dataclass

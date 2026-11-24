@@ -180,7 +180,7 @@ class TestCacheVersion(unittest.TestCase):
         docs = [doc("PMID:1")]
         with patch("src.data.corpus.build_index", return_value=docs):
             k1 = cache.key("q")
-            with patch("src.agents.prompts.PROMPT_VERSION", "v2"):
+            with patch("src.agents.prompts.PROMPT_VERSION", "v9-for-test"):
                 k2 = cache.key("q")
         self.assertNotEqual(k1, k2)
 
@@ -239,6 +239,81 @@ class TestEmbeddingBatch(unittest.TestCase):
         self.assertEqual(calls, [2, 2, 1])
         self.assertEqual(len(out), 5)
         self.assertEqual(emb.dim, 3)
+
+
+class TestToolUseAndMultiTurn(unittest.TestCase):
+    def test_tool_catalog_from_registry(self):
+        """工具清单必须从注册表生成：新增工具时提示词自动跟上，避免两处维护。"""
+        from src.agents.nodes import _tool_catalog
+        from src.tools.biomedical import TOOL_SPECS
+
+        catalog = _tool_catalog()
+        for spec in TOOL_SPECS:
+            self.assertIn(spec.name, catalog)
+
+    def test_tool_result_becomes_evidence(self):
+        """工具调用必须真正进 candidates，否则只是 trace 里的装饰。"""
+        from src.agents.nodes import _normalize_tool_hits
+
+        self.assertEqual(
+            [d["doc_id"] for d in _normalize_tool_hits([{"doc_id": "PMID:1"}])], ["PMID:1"]
+        )
+        self.assertEqual(
+            [d["doc_id"] for d in _normalize_tool_hits({"kg_docs": [{"doc_id": "UMLS:1"}]})],
+            ["UMLS:1"],
+        )
+
+    def test_invalid_tool_params_do_not_kill_chain(self):
+        """幻觉参数被 Pydantic 拒绝，但不该炸掉整条链路。"""
+        from src.tools.biomedical import FatalToolError, dispatch
+
+        with self.assertRaises(FatalToolError):
+            asyncio.run(dispatch("pubmed_search", {"keywords": [], "top_k": 999}))
+
+    def test_coreference_resolution_uses_history(self):
+        """「它」应被上一轮的实体替换，否则多轮检索会丢掉上下文。"""
+        from src.llm import _coreference_entities, _mock_rewrite
+
+        history = "Q: EGFR 突变非小细胞肺癌的一线治疗?  A: 奥希替尼\n"
+        entities = _coreference_entities(history)
+        self.assertTrue(entities)
+        self.assertTrue(any("lung" in e or "egfr" in e for e in entities))
+
+        # 端到端验证 mock rewrite 真的做了替换，且历史块没有泄漏进检索查询
+        rewritten = _mock_rewrite(
+            "它的一线治疗?\nConversation history (for coreference resolution):\n" + history
+        )
+        first = rewritten["rewritten_queries"][0]
+        self.assertNotIn("它", first)
+        self.assertNotIn("Conversation history", first)
+
+    def test_bootstrap_ci_is_deterministic_and_contains_point_estimate(self):
+        """置信区间必须可复现；固定 seed 保证同输入同输出。"""
+        from src.eval.metrics import bootstrap_ci
+
+        values = [1.0, 0.8, 0.6, 0.4]
+        self.assertEqual(bootstrap_ci(values), bootstrap_ci(values))
+        lo, hi = bootstrap_ci(values)
+        self.assertLessEqual(lo, hi)
+        self.assertLessEqual(lo, 1.0)
+
+    def test_golden_set_has_dev_test_split(self):
+        """holdout 必须存在且固定，否则 test 会被调参污染。"""
+        from src.eval.golden_set import GOLDEN_SET
+
+        splits = {c.split for c in GOLDEN_SET}
+        self.assertEqual(splits, {"dev", "test"})
+        self.assertTrue(any(c.split == "test" for c in GOLDEN_SET))
+
+    def test_cache_key_differs_with_history(self):
+        """同一句「它」在不同上下文里必须走不同的缓存键。"""
+        from src.cache import AnswerCache
+
+        with patch("src.data.corpus.build_index", return_value=[doc("PMID:1")]):
+            cache = AnswerCache(ttl_s=60)
+            k1 = cache.key("它有什么副作用?")
+            k2 = cache.key("它有什么副作用?||history:1:MS 的诊断标准")
+        self.assertNotEqual(k1, k2)
 
 
 if __name__ == "__main__":

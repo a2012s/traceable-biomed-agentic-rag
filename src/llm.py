@@ -216,11 +216,26 @@ def _mock_route(question: str) -> dict:
 def _mock_rewrite(question: str) -> dict:
     from .data.corpus import ABBREVIATIONS, resolve_senses
 
-    # nodes.py 会把上一轮反思意见拼到 question 后面，这里据此生成针对性查询
-    if "上一轮反思意见" in question:
-        base, _, focus = question.partition("\n上一轮反思意见：")
-    else:
-        base, focus = question, ""
+    # nodes.py 的拼接顺序：question + focus_hint + history_hint。
+    # 先把 history 块切出来（无论有没有 focus 块），再切 focus；
+    # 顺序搞反会让历史整段留在 base 里，检索查询被旧答案污染。
+    HISTORY_MARK = "\nConversation history (for coreference resolution):\n"
+    FOCUS_MARK = "\n上一轮反思意见："
+    base, sep, after = question.partition(HISTORY_MARK)
+    history_block = after if sep else ""
+    focus = ""
+    if sep:
+        base, fsep, ffocus = base.partition(FOCUS_MARK)
+        if fsep:
+            focus = ffocus
+    # 指代消解：取上一轮 Q 里出现在语料词表中的实体，替换本轮的「它/该病/这个药」。
+    # 只替换指代副词，历史块不参与检索——避免把整段旧问题粘进来污染检索。
+    markers = ("this drug", "its", "该病", "这个药", "此药", "它")
+    if history_block and any(marker in base for marker in markers):
+        entities = _coreference_entities(history_block)
+        if entities:
+            for marker in markers:
+                base = base.replace(marker, entities[0])
 
     # 只展开语境相符的义项：问"诊断标准"时不把 "mass spectrometry" 也塞进查询，
     # 否则质谱方法学论文会被召回并当成证据（MS 消歧做错方向比不做更糟）。
@@ -243,6 +258,29 @@ def _mock_rewrite(question: str) -> dict:
         "query_focus": "优先证据等级 1 的系统评价/RCT，并补充阴性结果与不良事件",
         "abbreviations_resolved": terms,
     }
+
+
+def _coreference_entities(history_block: str) -> list[str]:
+    """从历史 Q 中抽取可作指代目标的实体词（语料词表里出现过的实词）。
+
+    按出现顺序返回，优先长词：像 "non-small cell lung cancer" 比 "lung" 更具体，
+    用短词替换会丢掉消歧信息。
+    """
+    from .agents.tool_params import ALL_VOCAB
+
+    entities: list[str] = []
+    for line in history_block.splitlines():
+        if not line.startswith("Q:"):
+            continue
+        text = line[2:].lower()
+        # 英文/缩写：按词表直接匹配；中文：用词表里对本行有字面覆盖的短词匹配。
+        # 不用通用中文分词器（零依赖约束），用词表反查即可覆盖语料内的实体。
+        tokens = [t for t in text.replace("?", " ").replace("？", " ").split() if t in ALL_VOCAB]
+        tokens += [t for t in ALL_VOCAB if len(t) >= 3 and t in text]
+        for token in sorted(set(tokens), key=len, reverse=True):
+            if token not in entities:
+                entities.append(token)
+    return entities[:3]
 
 
 def _mock_ground(question: str) -> dict:

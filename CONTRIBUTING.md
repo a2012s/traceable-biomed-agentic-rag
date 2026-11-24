@@ -9,7 +9,7 @@
 uv venv .venv && source .venv/bin/activate
 uv pip install -e ".[real-vector]" ruff
 
-python -m unittest discover -s tests -t .    # 56 项测试，强制离线（tests/__init__.py 里设 LLM_PROVIDER=mock）
+python -m unittest discover -s tests -t .    # 65 项测试，强制离线（tests/__init__.py 里设 LLM_PROVIDER=mock）
 ruff check .
 python eval.py                               # 检索评估，秒级
 LLM_PROVIDER=mock python eval.py --full      # 端到端评估，免 key

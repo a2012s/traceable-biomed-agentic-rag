@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     allow_reindex: int = 0
     # 1=启用实体链接消歧（默认开，纯规则无网络）
     entity_linking: int = 1
+    # 1=启用 LLM 自主工具选择（Agent 核心能力：模型看 schema 决定调哪个工具、传什么参数）
+    tool_use_enabled: int = 1
+    # 单轮最多接受几个工具调用：防止模型一次塞十几个调用把延迟和上下文打爆
+    tool_use_max_calls: int = 3
     # 反馈闭环：默认关闭；开启后写本地 SQLite，生产多实例替换为共享 DB
     feedback_enabled: int = 0
     feedback_db: str = ".agentic_rag_feedback.db"

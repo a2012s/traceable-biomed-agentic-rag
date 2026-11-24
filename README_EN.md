@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](tests)
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
 [中文文档](README.md)
@@ -34,7 +34,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "What is the diagnostic criteria for MS?"
 python eval.py                                  # retrieval evaluation, seconds, no tokens burned
-python -m unittest discover -s tests -t .       # 56 unit / behavior tests
+python -m unittest discover -s tests -t .       # 65 unit / behavior tests
 ```
 
 `pip` works too: `pip install -e ".[real-vector]"`.
@@ -92,20 +92,22 @@ fills gaps with invention. This project puts one engineering constraint on each 
 
 ## 4. Measured Results (offline, reproducible)
 
-A 12-case golden set covering four data domains, abbreviation disambiguation, and cross-domain
-distractors. `python eval.py` reproduces retrieval metrics in seconds;
-`LLM_PROVIDER=mock python eval.py --full` reproduces end-to-end metrics without a key.
+A 12-case golden set (9 dev / 3 test holdout) covering four data domains, abbreviation
+disambiguation, and cross-domain distractors. `python eval.py` reproduces retrieval metrics in
+seconds; `LLM_PROVIDER=mock python eval.py --full` reproduces end-to-end metrics without a key.
+Every run writes per-case details and 95% bootstrap confidence intervals to `eval_runs/<timestamp>/`,
+so a metric regression can be traced to specific cases.
 
-**Reading note**: The first three rows use the pre-entity-linking ablation setup and require
-`ENTITY_LINKING=0` to reproduce. Row 4 is the current default (`ENTITY_LINKING=1`). These are
-measurements under different configurations, not different versions of one configuration.
+**Reading note**: Row 1 is retrieval-only (pre-linking). Rows 2–3 use the pre-entity-linking
+ablations and require `ENTITY_LINKING=0`. Row 4 is the current default (`ENTITY_LINKING=1`).
+These are measurements under different configurations, not different versions of one configuration.
 
 | Configuration | Recall@5 | MRR | Precision@5 | Citation precision | Distractor leakage | Evidence sufficiency |
 |---|---|---|---|---|---|---|
 | Single-path global retrieval (baseline) | 0.917 | 0.917 | 0.639 | — | — | — |
-| Multi-agent · orchestrator-pruned domains (`WIDE_RECALL=0`) | 0.868 | 0.917 | 0.772 | 0.785 | 0.083 | 0.750 |
-| Multi-agent · wide recall + cross-domain fusion (before entity linking) | **0.972** | **1.000** | 0.761 | 0.778 | 0.153 | **0.833** |
-| **Multi-agent · wide recall + entity linking (default)** | 0.910 | 0.958 | **0.772** | 0.785 | **0.083** | 0.833 |
+| Multi-agent · orchestrator-pruned domains (`WIDE_RECALL=0`) | 0.951 | 1.000 | 0.800 | 0.812 | 0.083 | 0.833 |
+| Multi-agent · wide recall + cross-domain fusion (before entity linking) | **0.972** | **1.000** | 0.775 | 0.792 | 0.153 | **0.833** |
+| **Multi-agent · wide recall + entity linking (default)** | 0.910 | 0.958 | **0.786** | **0.799** | **0.083** | 0.833 |
 
 Reproduction commands (top to bottom):
 
@@ -122,10 +124,11 @@ Same golden set and embedding throughout; only environment variables change. Run
 
 The point of this table is not "the default is best" but **every change can be falsified by metrics**:
 
-1. **Pruning domains costs recall**: 0.972 → 0.868. Rule routing is incomplete ("brain MRI
-   demyelination" matches no domain keyword, so the report domain never gets dispatched). Hence
-   `WIDE_RECALL=1` by default and pruning only when clearly irrelevant. The specialist agents don't
-   call an LLM, so an extra route costs milliseconds while a missing route costs evidence.
+1. **Pruning domains still costs recall**: 0.972 wide → 0.951 narrow. Rule routing is incomplete
+   ("brain MRI demyelination" matches no domain keyword, so the report domain never gets dispatched).
+   Tool use recovers part of the gap (0.868 before tool selection, 0.951 after), but remains below
+   wide recall. Hence `WIDE_RECALL=1` by default. The specialist agents don't call an LLM, so an
+   extra route costs milliseconds while a missing route costs evidence.
 2. **Fusion decides whether multi-source evidence reaches the prompt**: Concatenating each domain's
    Top-5 means generation sees only the first domain. Fusion dedupes by `doc_id`, re-ranks globally,
    and drops fragments below 50% of the best — MRR goes from 0.917 to 1.000.
@@ -136,14 +139,20 @@ The point of this table is not "the default is best" but **every change can be f
    by a unit test.
 4. **State the trade-off**: Wide recall once raised distractor leakage from 0.083 to 0.153 in
    exchange for +0.104 recall and +0.083 MRR. Adding entity linking (default on) brought leakage
-   back to 0.083 and lifted citation precision to 0.785 and Precision to 0.772, at the cost of
+   back to 0.083 and lifted citation precision to 0.799 and Precision to 0.786, at the cost of
    recall 0.972 → 0.910 and MRR 1.000 → 0.958 — a deliberate trade of "one fewer wrong document
    cited" for "one fewer right document recalled". Set `ENTITY_LINKING=0` to return to recall-first;
    wide/narrow recall remains controlled by `WIDE_RECALL`.
 
-> Small-sample caveat: 12 cases serve **regression comparison** (did a retrieval change degrade
-> things?), not production accuracy. Precision is naturally low on a 15-document toy corpus; don't
-> quote absolute values as generalizable performance.
+LLM-driven tool selection (on by default, `TOOL_USE_ENABLED=0` to disable) feeds tool results
+through the same reranker into the evidence chain. Measured end-to-end Precision rises 0.772→0.786
+(default) and 0.772→0.800 (narrow recall), with citation precision rising accordingly and
+distractor leakage unchanged — tool calls contribute to the answer, not just to the trace.
+
+> Small-sample caveat: 12 cases (9 dev / 3 test) serve **regression comparison**, not production
+> accuracy. Default 95% bootstrap intervals: Recall [0.75, 1.0], MRR [0.667, 1.0], Precision
+> [0.456, 0.822] — wide enough that 0.910 vs 0.972 cannot be distinguished from noise. The split
+> report confirms it: dev Recall 1.000 vs test 0.667. Don't quote absolute values as precision.
 
 ## 5. Code Layout
 
@@ -220,7 +229,7 @@ offline demo is unaffected. Configuration keys are in `.env.example`.
 | Cost gate | `MAX_TOKENS_PER_REQUEST` | Beyond the iteration cap, reflection also stops on a token budget or on zero new evidence, so exhausted queries don't spin |
 | Re-ranker circuit breaker | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | Batched request (no per-document HTTP) + instance-level breaker that never mutates global config |
 
-Measured: `python -m unittest discover -s tests -t .` passes 56 tests; `python eval.py` and
+Measured: `python -m unittest discover -s tests -t .` passes 65 tests; `python eval.py` and
 `python eval.py --full` show no metric regression.
 
 Still demo-scope and not claimed as done: real corpus and version filtering, token-level streaming,

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](tests)
 
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
@@ -31,7 +31,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "MS 的诊断标准是什么？"
 python eval.py                      # 检索评估，秒级，不烧 token
-python -m unittest discover -s tests -t .   # 56 项单元/行为测试
+python -m unittest discover -s tests -t .   # 65 项单元/行为测试
 ```
 
 `pip` 同样可用：`pip install -e ".[real-vector]"`。
@@ -85,18 +85,20 @@ key 为空或 `LLM_PROVIDER=mock` 时自动降级到规则引擎，链路照常�
 
 ## 4. 实测数据（离线可复现）
 
-12 条金标集，覆盖四种数据域、缩写消歧、跨域干扰；`python eval.py` 秒级复现检索指标，
-`LLM_PROVIDER=mock python eval.py --full` 复现端到端指标（无需 key）。
+12 条金标集（9 dev / 3 test holdout），覆盖四种数据域、缩写消歧、跨域干扰；
+`python eval.py` 秒级复现检索指标，`LLM_PROVIDER=mock python eval.py --full` 复现端到端指标（无需 key）。
+每次 eval 把逐样本明细与 95% bootstrap 置信区间写入 `eval_runs/<timestamp>/`，
+指标掉了能直接定位到具体 case。
 
-**口径说明**：前 3 行为实体链接引入前的消融口径，复现时需加 `ENTITY_LINKING=0`；
-第 4 行为当前默认（`ENTITY_LINKING=1`）。四行分别是不同配置下的实测，不是同一配置的不同版本。
+**口径说明**：第 1 行为检索-only（实体链接前），第 2–3 行为实体链接引入前的端到端口径（需加 `ENTITY_LINKING=0`），
+第 4 行为当前默认（`ENTITY_LINKING=1`）。四行是不同配置下的实测，不是同一配置的不同版本。
 
 | 配置 | Recall@5 | MRR | Precision@5 | 引用准确率 | 干扰泄漏 | 证据充分率 |
 |---|---|---|---|---|---|---|
 | 单路全局检索（基线） | 0.917 | 0.917 | 0.639 | — | — | — |
-| 多 agent · 编排器裁剪数据域（`WIDE_RECALL=0`） | 0.868 | 0.917 | 0.772 | 0.785 | 0.083 | 0.750 |
-| 多 agent · 全量召回 + 跨域融合（实体链接前） | **0.972** | **1.000** | 0.761 | 0.778 | 0.153 | **0.833** |
-| **多 agent · 全量召回 + 实体链接（默认）** | 0.910 | 0.958 | **0.772** | 0.785 | **0.083** | 0.833 |
+| 多 agent · 编排器裁剪数据域（`WIDE_RECALL=0`） | 0.951 | 1.000 | 0.800 | 0.812 | 0.083 | 0.833 |
+| 多 agent · 全量召回 + 跨域融合（实体链接前） | **0.972** | **1.000** | 0.775 | 0.792 | 0.153 | 0.833 |
+| **多 agent · 全量召回 + 实体链接（默认）** | 0.910 | 0.958 | **0.786** | **0.799** | **0.083** | 0.833 |
 
 复现命令（由上到下）：
 
@@ -111,11 +113,17 @@ LLM_PROVIDER=mock python eval.py --full                                      # �
 `ENTITY_LINKING=1`（默认），检索-only 的 MRR 是 0.875，不是表中基线的 0.917——
 这是实体链接对 eGFR/EGFR 另一义项降权的预期结果。
 
+LLM 自主工具选择（默认开，`TOOL_USE_ENABLED=0` 可关）让工具返回的文档经同一 reranker
+打分后进入证据链。实测端到端 Precision 提升 0.772→0.786（默认档）、0.772→0.800（窄召回档），
+引用准确率同步上升，干扰泄漏不变——工具调用对答案是真实贡献，不是 trace 装饰。
+
 这张表最值得讲的不是"默认配置最好"，而是**每一项改动都能被指标证伪**：
 
-1. **编排器裁剪数据域会掉召回**：0.972 → 0.868。规则路由枚举不全（"brain MRI demyelination"
-   匹配不到任何领域关键词 → 报告域根本没被分派），所以默认 `WIDE_RECALL=1`（召回优先），
-   只在明确无关时裁剪。专家 agent 不调 LLM，多跑一路是毫秒级成本，漏一路却少一条证据。
+1. **编排器裁剪数据域仍会掉召回**：全量 0.972 → 窄召回 0.951。规则路由枚举不全
+   （"brain MRI demyelination" 匹配不到任何领域关键词 → 报告域没被分派）；窄召回靠工具
+   调用补回了一部分（旧值 0.868，开启工具选择后 0.951），但仍低于全量召回。所以默认
+   `WIDE_RECALL=1`，只在明确无关时裁剪。专家 agent 不调 LLM，多跑一路是毫秒级成本，
+   漏一路却少一条证据。
 2. **跨域融合决定多源证据能不能进上下文**：各域各取 Top-5 直接拼接，生成节点只看得到
    第一个数据域那几条；融合节点按 `doc_id` 去重、按分数全局重排、丢掉低于最佳 50% 的片段，
    MRR 从 0.917 提到 1.000。
@@ -123,12 +131,14 @@ LLM_PROVIDER=mock python eval.py --full                                      # �
    让语料外问题也被判"证据充分"；改成「缩写就地铁换成语境义项」后，假 grounded 消失，
    语料外问题（CRISPR 治疗镰状细胞病）稳定返回"证据不足"——这条有单测锁定。
 4. **代价与取舍说清楚**：全量召回曾把干扰泄漏从 0.083 抬到 0.153，换来召回 +0.104、MRR +0.083。
-   加实体链接后（默认开）干扰泄漏回落到 0.083、引用准确率升到 0.785、Precision 升到 0.772，
+   加实体链接后（默认开）干扰泄漏回落到 0.083、引用准确率升到 0.799、Precision 升到 0.786，
    但召回 0.972 → 0.910、MRR 1.000 → 0.958 —— 这是"少引用错文档"换"少召回一条对文档"的主动取舍，
    可通过 `ENTITY_LINKING=0` 退回召回优先档。宽/窄召回仍由 `WIDE_RECALL` 控制。
 
-> 小样本提醒：12 条样本用于**回归对比**（改了检索是否退化），不能当作生产精度。
-> Precision 在这类 15 文档玩具语料上天然偏低，别拿绝对值对外宣称。
+> 小样本提醒：12 条样本（9 dev / 3 test）用于**回归对比**，不能当作生产精度。
+> 默认配置的 95% bootstrap 区间：Recall [0.75, 1.0]、MRR [0.667, 1.0]、Precision [0.456, 0.822]——
+> 宽度说明小样本上 0.910 与 0.972 的差异无法区分信号与噪声。分层报告也印证了这点：
+> dev 9 条 Recall 1.000，test 3 条只有 0.667。别拿这些绝对值对外宣称精度。
 
 ## 5. 代码结构
 
@@ -139,6 +149,7 @@ src/
 │  ├─ nodes.py        编排 / 重写 / 四个域 agent（工厂）/ 融合 / 反思 / 生成
 │  ├─ prompts.py      提示词集中管理，便于迭代与评估
 │  └─ tool_params.py  工具入参抽取：查询 ∩ 语料词表，不硬编码领域名词
+│  （tool_use 节点）LLM 看工具 schema 自主选工具，结果经 reranker 进证据链
 ├─ rag/
 │  ├─ retriever.py    BM25 + 向量 + KG 三路召回，RRF 融合
 │  ├─ reranker.py     IDF 加权余弦打分（cross-encoder 占位）+ 跨域融合 + 证据窗口
@@ -164,6 +175,9 @@ src/
 | 依赖懒加载 | `deps.py` 用 `lru_cache` | 模块顶层建索引会让 `import` 付出全量代价，也让测试无法注入替身 |
 | 错误二分 | 超时/429 → 指数退避重试；参数非法/未知工具 → 立即失败 | 前者状态可恢复，重试有意义；后者重试只会放大成本 |
 | 单注册表 | `ToolSpec(name, schema, handler, description)` | 早期 handler 与 schema 分两处维护，加工具必忘一处；现在还能直接导出 MCP schema |
+| LLM 自主工具选择 | `tool_use` 节点与 query_rewriter 并行，模型看 schema 选工具，结果进证据链 | 固定工具映射只是 trace 装饰；实测自主选择让默认档 Precision +0.014、引用准确率 +0.014 |
+| 多轮只传文本不传状态 | `history` 只把 Q/A 文本送进 query_rewriter 做指代消解，不复用 thread 内部状态 | 复用状态会让上一轮的 evidences/reflection_count 泄漏到新问题，出现"越聊越离谱" |
+| 评测留出 holdout | 12 条切成 9 dev / 3 test，test 不参与调参；落逐样本 jsonl 与 bootstrap CI | 同一批样本既调参又报告会有乐观偏差；分层报告实测 dev Recall 1.000 vs test 0.667 |
 | 测试强制离线 | `tests/__init__.py` 里设 `LLM_PROVIDER=mock` | 否则本地跑测试会打到 `.env` 里的付费 API（真实踩过） |
 
 ## 7. 哪些是真的，哪些是模拟的
@@ -179,6 +193,9 @@ src/
 | hash Embedding | ⚠️ 降级兜底，语义能力弱；用 crc32 投影，跨进程可复现（不用随机化的 `hash()`） |
 | Cross-Encoder 重排 | ⚠️ 用 IDF 加权余弦 + 先验模拟，`score()` 换成 bge-reranker 即可 |
 | 四个生物医学工具 | ⚠️ 本地语料模拟，`pubmed_search` 等替换为真实 API 即可 |
+| LLM 工具选择 | ✅ 真实调用链（模型输出 → Pydantic 校验 → dispatch → reranker → 证据）；mock 模式用领域规则模拟 |
+| 多轮指代消解 | ⚠️ 上下文传递与缓存隔离是真实的；mock 模式用词表反查做启发式消解，真实模型用 prompt 完成 |
+| 95% 置信区间 | ✅ bootstrap 重采样实现；但 n=12 区间很宽，只标注不确定性，不构成显著性结论 |
 | Critic | ⚠️ 规则判定（可解释、零成本），非 LLM judge |
 | 语料 | ⚠️ 虚构教学数据，编号与真实记录无关 |
 
@@ -203,7 +220,7 @@ src/
 | 成本闸门 | `MAX_TOKENS_PER_REQUEST` | 反思除轮次上限外，再加 token 预算与"本轮零新增证据"早停，避免枯竭查询空转 |
 | 外部重排熔断 | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | 批量请求（不再逐文档发 HTTP）+ 实例级熔断，失败不改写全局配置 |
 
-实测：`python -m unittest discover -s tests -t .` 56 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
+实测：`python -m unittest discover -s tests -t .` 65 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
 
 仍属 Demo 范畴、没有假装完成的部分：真实语料与版本过滤、token 级流式、多实例共享检查点/指标/反馈（当前是进程内）、
 速率限制与鉴权（当前只有并发上限）。这些需要外部资源，代码留了接口但没有虚构实现。

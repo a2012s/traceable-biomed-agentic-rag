@@ -61,6 +61,11 @@ def after_critique(state: AgentState) -> str:
     return "rewrite_again"
 
 
+async def tool_gate(state: AgentState) -> dict:
+    """fan-in 空节点：本身不改状态，只用于等待 tool_use 与 query_rewriter 两路完成。"""
+    return {}
+
+
 def increment_reflection(state: AgentState) -> dict:
     """回流前把反思意见写进 query_focus。
 
@@ -88,6 +93,8 @@ def build_graph(verbose: bool | None = None):
     graph = StateGraph(AgentState)
     graph.add_node("orchestrator", nodes.orchestrator)
     graph.add_node("query_rewriter", nodes.query_rewriter)
+    graph.add_node("tool_use", nodes.tool_use)
+    graph.add_node("tool_gate", tool_gate)
     for name in AGENT_NAMES:
         graph.add_node(name, AGENT_FUNCS[name])
     graph.add_node("critic", nodes.critic)
@@ -96,8 +103,13 @@ def build_graph(verbose: bool | None = None):
     graph.add_node("generate", nodes.generate)
 
     graph.add_edge(START, "orchestrator")
+    # 工具选择与查询重写无数据依赖，并行分叉；tool_gate 作为 fan-in 汇聚点，
+    # 等两路都写完再 fan-out 到域 agent。不能让两个源各自连条件边——那会重复触发 agent。
+    graph.add_edge("orchestrator", "tool_use")
     graph.add_edge("orchestrator", "query_rewriter")
-    graph.add_conditional_edges("query_rewriter", route_to_agents, AGENT_NAMES)
+    graph.add_edge("tool_use", "tool_gate")
+    graph.add_edge("query_rewriter", "tool_gate")
+    graph.add_conditional_edges("tool_gate", route_to_agents, AGENT_NAMES)
     for name in AGENT_NAMES:
         # 并行 agent 先汇聚到融合节点（fan-in），再统一验收
         graph.add_edge(name, "fuse")
@@ -124,12 +136,21 @@ def _compiled_app():
     return build_graph(verbose=None)
 
 
-async def run(question: str, verbose: bool | None = None, thread_id: str | None = None) -> dict:
+async def run(
+    question: str,
+    verbose: bool | None = None,
+    thread_id: str | None = None,
+    history: list[dict] | None = None,
+) -> dict:
     """跑一次完整问答。
 
-    thread_id 必须每次唯一（除非刻意续跑同一会话）：checkpointer 按 thread_id 恢复状态，
-    复用同一个 id 会让下一题的 evidences/reflection_count 接着上一题，
-    批量评估时表现为指标忽高忽低（且极难定位）。
+    thread_id 每次唯一（除非刻意续跑同一会话）：checkpointer 按 thread_id 恢复状态，
+    复用同一个 id 会让下一题的 evidences/reflection_count 接着上一题。
+
+    history 是多轮对话的上下文（[{"question", "answer"}, ...]）。它与 thread_id 续跑
+    是两条独立路径：history 只把**问题文本**喂给 query_rewriter 做指代消解，
+    不恢复上一轮的内部状态——后者会让旧证据/反思计数泄漏到新问题，
+    是「多轮越聊越离谱」的典型根因。
     """
     if verbose is not None:
         configure_logging(verbose)
@@ -137,8 +158,12 @@ async def run(question: str, verbose: bool | None = None, thread_id: str | None 
     from ..deps import get_answer_cache
     from ..observability import metrics
 
+    # 缓存键必须区分历史：同一句「它有什么副作用？」在不同上下文里答案不同
+    cache_key = question if not history else f"{question}||history:{len(history)}:" + "|".join(
+        str(h.get("question", ""))[:60] for h in history[-3:]
+    )
     cache = get_answer_cache()
-    hit = cache.get(question)
+    hit = cache.get(cache_key)
     if hit is not None:
         metrics.cache_hit()
         cached = dict(hit)
@@ -149,9 +174,9 @@ async def run(question: str, verbose: bool | None = None, thread_id: str | None 
 
     app = _compiled_app()
     result = await app.ainvoke(
-        {"question": question},
+        {"question": question, "history": history or []},
         config={"configurable": {"thread_id": thread_id or f"run-{uuid.uuid4().hex}"}},
     )
     result["cache_hit"] = False
-    cache.put(question, result)
+    cache.put(cache_key, result)
     return result
