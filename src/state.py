@@ -83,6 +83,13 @@ class AgentState(TypedDict, total=False):
     critique: str
     grounded: bool
     reflection_count: int
+    # ---- Human-in-the-loop ----
+    # review_count: 已发生的人工确认次数。写在 resume 之后（中断时节点尚未返回），
+    # 因此恢复后重跑同一节点时它能挡住第二次中断。
+    review_count: int
+    review_decision: str      # approve（带不确定性继续）| refine（再检索）| abort（拒答）
+    review_note: str          # 人工补充说明，refine 时拼进下一轮 query_focus
+    review_payload: dict      # 中断时给前端的确认单（恢复后回填，便于前端复现上下文）
     answer: str
     citations: list[str]
     final: str

@@ -9,7 +9,7 @@
 uv venv .venv && source .venv/bin/activate
 uv pip install -e ".[real-vector]" ruff
 
-python -m unittest discover -s tests -t .    # 65 项测试，强制离线（tests/__init__.py 里设 LLM_PROVIDER=mock）
+python -m unittest discover -s tests -t .    # 76 项测试，强制离线（tests/__init__.py 里设 LLM_PROVIDER=mock）
 ruff check .
 python eval.py                               # 检索评估，秒级
 LLM_PROVIDER=mock python eval.py --full      # 端到端评估，免 key
@@ -45,6 +45,15 @@ cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 4. `src/agents/nodes.py` 用 `make_domain_agent(...)` 注册；
 5. `src/agents/nodes.py::AGENT_NAMES` 与 `graph.py` 的节点注册会自动带上它；
 6. `src/eval/golden_set.py` 补 2~3 条金标样本，跑 `eval.py` 确认未退化。
+
+## 新增一个图节点
+
+新增节点除了改 `graph.py`，还有三处必须同步，否则线上会"跑了但看不见"：
+
+1. `web/server.py::AGENT_LABELS` 与 `web/index.html::LABELS` 各加一条中文名；
+2. 若节点在流水线里是必经步骤，`web/index.html::PIPELINE` 也要加（HITL 的 `human_review` 因为是
+   条件节点，采用"出现才插入"的方式，可参考现有实现）；
+3. `tests/` 补一个直接跑该节点的测试，不要只靠 `eval.py` 端到端覆盖——端到端看不出停在哪一步。
 
 ## 提交信息
 

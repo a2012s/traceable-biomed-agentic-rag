@@ -8,7 +8,8 @@
 - asyncio.Semaphore 限并发 + 单请求超时，避免多 worker 下雪崩；
 - request_id 贯穿响应头与响应体，便于跨日志定位；
 - /api/metrics 暴露请求数、错误数、延迟分位、缓存命中率；
-- 答案缓存命中直接跳过图执行（键含语料版本与模型档位）。
+- 答案缓存命中直接跳过图执行（键含语料版本与模型档位）；
+- HITL：Critic 判证据不足时返回 interrupted=True + 确认单，/api/ask/resume 续跑。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import time
+import uuid
 
 if os.environ.get("WEB_ALLOW_REAL_LLM", "0") != "1":
     os.environ["LLM_PROVIDER"] = "mock"
@@ -27,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from src.agents.graph import resume as resume_graph
 from src.agents.graph import run as run_graph
 from src.cache import normalize_question
 from src.config import get_settings
@@ -60,6 +63,8 @@ AGENT_LABELS = {
     "fuse": "跨域融合",
     "critic": "Critic 验收",
     "reflect-loop": "反思回流",
+    "human_review": "人工确认",
+    "refuse": "人工中止",
     "generate": "答案生成",
 }
 
@@ -76,6 +81,13 @@ class FeedbackRequest(BaseModel):
     rating: int = Field(ge=-1, le=1)
     reason: str = Field(default="", max_length=200)
     request_id: str = Field(default="", max_length=64)
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str = Field(min_length=8, max_length=100)
+    # approve=带不确定性继续生成 / refine=按补充说明再检索 / abort=中止并拒答
+    decision: str = Field(pattern="^(approve|refine|abort)$")
+    note: str = Field(default="", max_length=200)
 
 
 def _mode() -> str:
@@ -95,10 +107,22 @@ def _request_id(request: Request) -> str:
 
 
 async def _execute(question: str, thread_id: str | None, history: list[dict] | None = None) -> dict:
-    """带并发闸门与超时的链路执行。"""
+    """带并发闸门与超时的链路执行。
+
+    中断态同样走这条路径：图停在 human_review 就立即返回，检查点留在内存/磁盘里，
+    不会长期占着信号量——否则一次没人点确认的请求会卡死整个演示页。
+    """
     async with _semaphore:
         return await asyncio.wait_for(
             run_graph(question.strip(), verbose=False, thread_id=thread_id, history=history),
+            timeout=settings.request_timeout_s,
+        )
+
+
+async def _execute_resume(thread_id: str, decision: str, note: str) -> dict:
+    async with _semaphore:
+        return await asyncio.wait_for(
+            resume_graph(thread_id, decision, note),
             timeout=settings.request_timeout_s,
         )
 
@@ -119,6 +143,13 @@ def _payload(state: dict, request_id: str, latency_ms: float) -> dict:
         "critique": state.get("critique", ""),
         "grounded": bool(state.get("grounded", False)),
         "reflection_count": state.get("reflection_count", 0),
+        # HITL：被中断时 answer 为空，前端据 interrupted/review 弹确认面板，
+        # 再用 thread_id 调 /api/ask/resume 续跑
+        "interrupted": bool(state.get("interrupted", False)),
+        "review": state.get("review") or None,
+        "review_count": state.get("review_count", 0),
+        "review_decision": state.get("review_decision", ""),
+        "thread_id": state.get("thread_id", ""),
         "token_usage": state.get("token_usage", {}),
         "latency_ms": round(latency_ms, 1),
         "mode": _mode(),
@@ -140,6 +171,7 @@ async def health() -> dict:
         "checkpointer": settings.checkpointer,
         "max_concurrency": settings.max_concurrency,
         "cache_ttl_s": settings.answer_cache_ttl_s,
+        "hitl": bool(settings.hitl_enabled),
     }
 
 
@@ -179,13 +211,19 @@ async def feedback_summary() -> dict:
 
 @app.post("/api/ask")
 async def ask(req: AskRequest, request: Request) -> JSONResponse:
-    """跑一次完整问答，返回决策链 + 证据 + 答案。"""
+    """跑一次完整问答，返回决策链 + 证据 + 答案。
+
+    开启 HITL 且 Critic 判证据不足时，返回 `interrupted=true` 与确认单（answer 为空），
+    调用方拿 `thread_id` 调 /api/ask/resume 给出决定后续跑。
+    """
     request_id = _request_id(request)
     started = time.perf_counter()
     metrics.start()
     ok = False
     try:
-        state = await _execute(req.question, req.thread_id, req.history)
+        # 自己生成 thread_id：中断后续跑要靠它找回检查点，不能指望客户端回传
+        thread_id = req.thread_id or f"web-{uuid.uuid4().hex[:16]}"
+        state = await _execute(req.question, thread_id, req.history)
         payload = _payload(state, request_id, (time.perf_counter() - started) * 1000)
         ok = True
         return JSONResponse(payload, headers={"X-Request-ID": request_id})
@@ -193,6 +231,32 @@ async def ask(req: AskRequest, request: Request) -> JSONResponse:
         raise HTTPException(status_code=504, detail=f"链路超时（{settings.request_timeout_s}s）[{request_id}]") from exc
     except Exception as exc:  # noqa: BLE001 - 演示页需要把失败原因显示给用户
         raise HTTPException(status_code=500, detail=f"链路执行失败（{request_id}）：{exc}") from exc
+    finally:
+        metrics.finish(started, ok=ok)
+
+
+@app.post("/api/ask/resume")
+async def ask_resume(req: ResumeRequest, request: Request) -> JSONResponse:
+    """按人工决定续跑被中断的请求。
+
+    thread_id 不存在待恢复检查点时返回 409：这通常是页面刷新后重复点击，
+    或请求已超时被清理，需要重新提问而不是重试同一个 id。
+    """
+    request_id = _request_id(request)
+    started = time.perf_counter()
+    metrics.start()
+    ok = False
+    try:
+        state = await _execute_resume(req.thread_id, req.decision, req.note)
+        payload = _payload(state, request_id, (time.perf_counter() - started) * 1000)
+        ok = True
+        return JSONResponse(payload, headers={"X-Request-ID": request_id})
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=f"续跑超时（{settings.request_timeout_s}s）[{request_id}]") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"续跑失败（{request_id}）：{exc}") from exc
     finally:
         metrics.finish(started, ok=ok)
 
@@ -212,7 +276,8 @@ async def ask_stream(req: AskRequest, request: Request) -> StreamingResponse:
     async def events():
         ok = False
         try:
-            state = await _execute(req.question, req.thread_id, req.history)
+            thread_id = req.thread_id or f"web-{uuid.uuid4().hex[:16]}"
+            state = await _execute(req.question, thread_id, req.history)
             payload = _payload(state, request_id, (time.perf_counter() - started) * 1000)
             yield f"event: result\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield "event: done\ndata: {}\n\n"

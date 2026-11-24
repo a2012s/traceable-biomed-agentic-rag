@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen.svg)](tests)
 
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
@@ -31,7 +31,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "MS 的诊断标准是什么？"
 python eval.py                      # 检索评估，秒级，不烧 token
-python -m unittest discover -s tests -t .   # 65 项单元/行为测试
+python -m unittest discover -s tests -t .   # 76 项单元/行为测试
 ```
 
 `pip` 同样可用：`pip install -e ".[real-vector]"`。
@@ -80,6 +80,7 @@ key 为空或 `LLM_PROVIDER=mock` 时自动降级到规则引擎，链路照常�
 | 三路混合召回 | BM25 精确匹配 + Qdrant HNSW 向量 + KG 概念扩展，RRF 融合 | 单一召回漏检：药名/基因名靠 BM25，语义靠向量，概念靠图谱 |
 | 跨域融合 | 按 `doc_id` 去重 → 按分数全局重排 → 丢弃低于最佳 50% 的片段 | 各域各自取 Top-k 后直接拼接，生成只看到单一数据域；通用词偶然命中会污染引用 |
 | Critic 反思 | 高等级证据 ≥1、独立数据源 ≥2、命中实体 ≥2，否则回流重写（有轮次上限） | "证据不足仍强行生成" |
+| 人工确认断点 | 机器本来还要再检索一轮时，图在 `human_review` 节点暂停并返回确认单；人工选继续 / 按补充说明再检索 / 中止后续跑 | "机制判断不了该不该继续，却只会两种反应：闷头烧钱，或武断拒答" |
 | 引用校验 | 生成结果里的 citation 必须存在于证据集 | 编造引用（幻觉最容易被发现的一种） |
 | 语料外拒答 | 打分只用「原问题 + 缩写展开」，不用重写后的通用词 | 重写器追加的 "systematic review" 让任何文档都"相关"→ 假 grounded |
 
@@ -145,21 +146,24 @@ LLM 自主工具选择（默认开，`TOOL_USE_ENABLED=0` 可关）让工具返�
 ```
 src/
 ├─ agents/
-│  ├─ graph.py        状态机：条件边、并行 fan-out、反思回流、checkpointer
-│  ├─ nodes.py        编排 / 重写 / 四个域 agent（工厂）/ 融合 / 反思 / 生成
+│  ├─ graph.py        状态机：条件边、并行 fan-out、反思回流、HITL 断点、checkpointer
+│  ├─ nodes.py        编排 / 重写 / 工具选择 / 四域 agent（工厂）/ 融合 / 反思 / 人工确认 / 生成
 │  ├─ prompts.py      提示词集中管理，便于迭代与评估
 │  └─ tool_params.py  工具入参抽取：查询 ∩ 语料词表，不硬编码领域名词
-│  （tool_use 节点）LLM 看工具 schema 自主选工具，结果经 reranker 进证据链
 ├─ rag/
 │  ├─ retriever.py    BM25 + 向量 + KG 三路召回，RRF 融合
 │  ├─ reranker.py     IDF 加权余弦打分（cross-encoder 占位）+ 跨域融合 + 证据窗口
 │  ├─ embedding.py    可插拔 Embedding：hash / tfidf / api（真模型）
 │  └─ vector_store.py Qdrant 本地 HNSW + numpy 兜底，同一接口
 ├─ tools/biomedical.py  ToolSpec 单注册表：Pydantic 校验、异步、错误二分、MCP schema 导出
-├─ eval/               金标集、检索/生成指标、评估运行器
+├─ eval/               金标集、检索/生成指标、评估运行器（bootstrap CI、逐样本落盘）
 ├─ deps.py             懒加载依赖容器（import 不触发建索引）
 ├─ state.py            共享状态与 reducer（去重累积 / 累加计量）
 └─ llm.py              真实/Mock 双模式、分层路由、指数退避、真实 token 计量
+
+web/
+├─ server.py           FastAPI：/api/ask（含 interrupted 契约）、/api/ask/resume、SSE、metrics
+└─ index.html          单页演示：决策链、证据卡片、引用高亮、人工确认面板
 ```
 
 ## 6. 设计决策与依据
@@ -177,6 +181,8 @@ src/
 | 单注册表 | `ToolSpec(name, schema, handler, description)` | 早期 handler 与 schema 分两处维护，加工具必忘一处；现在还能直接导出 MCP schema |
 | LLM 自主工具选择 | `tool_use` 节点与 query_rewriter 并行，模型看 schema 选工具，结果进证据链 | 固定工具映射只是 trace 装饰；实测自主选择让默认档 Precision +0.014、引用准确率 +0.014 |
 | 多轮只传文本不传状态 | `history` 只把 Q/A 文本送进 query_rewriter 做指代消解，不复用 thread 内部状态 | 复用状态会让上一轮的 evidences/reflection_count 泄漏到新问题，出现"越聊越离谱" |
+| HITL 用图内断点而非外部队列 | `interrupt()` 停在 `human_review` 节点，`Command(resume=...)` 从该点续跑 | 断点状态由 checkpointer 保存，人工决定后不必重跑前面的检索与反思；外部队列得自己维护中间态 |
+| HITL 默认关 | `HITL_ENABLED=0`，只有 Web 演示显式开启 | `eval.py` 与批处理无人值守，中断会让进程停在等人这一步——默认开等于把离线评测挂死 |
 | 评测留出 holdout | 12 条切成 9 dev / 3 test，test 不参与调参；落逐样本 jsonl 与 bootstrap CI | 同一批样本既调参又报告会有乐观偏差；分层报告实测 dev Recall 1.000 vs test 0.667 |
 | 测试强制离线 | `tests/__init__.py` 里设 `LLM_PROVIDER=mock` | 否则本地跑测试会打到 `.env` 里的付费 API（真实踩过） |
 
@@ -195,6 +201,7 @@ src/
 | 四个生物医学工具 | ⚠️ 本地语料模拟，`pubmed_search` 等替换为真实 API 即可 |
 | LLM 工具选择 | ✅ 真实调用链（模型输出 → Pydantic 校验 → dispatch → reranker → 证据）；mock 模式用领域规则模拟 |
 | 多轮指代消解 | ⚠️ 上下文传递与缓存隔离是真实的；mock 模式用词表反查做启发式消解，真实模型用 prompt 完成 |
+| 人工确认断点 | ✅ LangGraph `interrupt` + `Command(resume)` 真实暂停/续跑，三种决定各走独立出口；断点存活范围受 checkpointer 限制 |
 | 95% 置信区间 | ✅ bootstrap 重采样实现；但 n=12 区间很宽，只标注不确定性，不构成显著性结论 |
 | Critic | ⚠️ 规则判定（可解释、零成本），非 LLM judge |
 | 语料 | ⚠️ 虚构教学数据，编号与真实记录无关 |
@@ -219,8 +226,27 @@ src/
 | 检索鲁棒性 | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | 融合保底防止"最佳项离群→只剩 1 条→必然拒答"；RRF 先过滤再排名，单域检索不再被摊薄；重排只取前 N 条候选 |
 | 成本闸门 | `MAX_TOKENS_PER_REQUEST` | 反思除轮次上限外，再加 token 预算与"本轮零新增证据"早停，避免枯竭查询空转 |
 | 外部重排熔断 | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | 批量请求（不再逐文档发 HTTP）+ 实例级熔断，失败不改写全局配置 |
+| 人工确认断点 | `HITL_ENABLED=1` | Critic 判不足且机器本来还要再检索时，`POST /api/ask` 返回 `interrupted=true` + 确认单，`POST /api/ask/resume` 带 `thread_id` + 决定续跑（见下方代码块） |
 
-实测：`python -m unittest discover -s tests -t .` 65 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
+HITL 的三种决定：`approve` 带不确定性继续生成（证据不变，`grounded` 仍为 false）；
+`refine` 把人工补充说明拼进 `query_focus` 再检索一轮（计入反思轮次，不能靠反复点绕过 `MAX_REFLECTIONS`）；
+`abort` 走独立 `refuse` 节点直接拒答，**不调用生成模型**。
+
+```bash
+# 1) 中断：Critic 判证据不足，图停在 human_review
+curl -s localhost:8765/api/ask -H 'Content-Type: application/json' \
+  -d '{"question":"mass spectrometry 质谱分析在血清蛋白定量中的应用"}'
+# → {"interrupted": true, "thread_id": "web-…", "review": {"critique": "…", "options": [...] }}
+
+# 2) 续跑：三种决定之一，可带补充说明
+curl -s localhost:8765/api/ask/resume -H 'Content-Type: application/json' \
+  -d '{"thread_id":"web-…","decision":"refine","note":"只看血清蛋白定量"}'
+# → {"interrupted": false, "review_decision": "refine", "reflection_count": 1, "answer": "…"}
+```
+
+已完成的 thread 再调 resume 返回 409（不会悄悄重跑一遍重复计费），`decision` 非法返回 422。
+
+实测：`python -m unittest discover -s tests -t .` 76 项通过；`python eval.py` 与 `python eval.py --full` 指标未退化。
 
 仍属 Demo 范畴、没有假装完成的部分：真实语料与版本过滤、token 级流式、多实例共享检查点/指标/反馈（当前是进程内）、
 速率限制与鉴权（当前只有并发上限）。这些需要外部资源，代码留了接口但没有虚构实现。
@@ -244,6 +270,8 @@ AST 级切分（tree-sitter，别按字符切坏函数）、符号索引与调�
   多 worker 不共享；结果缓存是进程内 TTL，多实例不共享
 - 词形碰撞已加实体链接降权（干扰泄漏 0.153 → 0.083），但仍是规则判据而非 UMLS 实体链接；
   `eGFR`（肾功能）与 `EGFR`（基因）在更复杂语境下仍可能残留同形误召回
+- 人工确认的断点存在 checkpointer 里：`CHECKPOINTER=memory`（默认）时进程重启即丢失、多 worker 也不共享，
+  生产要配 `sqlite`/Redis 才能让人工确认跨重启存活
 - Reranker 是 IDF 加权余弦模拟，不是真 cross-encoder；语义改写型查询仍需 `EMBEDDING_BACKEND=api`
 
 ## 10. 五个核心设计要点
@@ -264,10 +292,14 @@ AST 级切分（tree-sitter，别按字符切坏函数）、符号索引与调�
 | `MS 的诊断标准是什么？` | 缩写消歧方向正确：只展开 multiple sclerosis，不把质谱方法学论文带进引用 |
 | `mass spectrometry 质谱分析在血清蛋白定量中的应用` | 证据等级不足 → 触发多轮反思回流 → 如实标注"证据不足" |
 | `CRISPR base editing 在镰状细胞病中的长期安全性如何？` | 语料外问题：evidence 为空、`grounded=False`、跑满上限后明确拒答 |
+| `mass spectrometry 质谱分析在血清蛋白定量中的应用`（加 `HITL_ENABLED=1`） | Critic 判证据不足 → 图暂停并弹出确认单；选「再检索」带回补充说明多跑一轮，选「中止」不调用生成模型直接拒答 |
 
 ```bash
 VERBOSE=1 python run.py "mass spectrometry 质谱分析在血清蛋白定量中的应用"   # 看实时决策链
+HITL_ENABLED=1 uvicorn web.server:app --port 8765                          # 打开人工确认面板
 ```
+
+> 语料外（CRISPR）那条不会弹确认：证据为 0 说明检索已枯竭，再问人只是噪音，图会直接走到拒答。
 
 ## 12. 开源与协作
 

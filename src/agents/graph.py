@@ -2,6 +2,9 @@
 
 反思回流用条件边实现：证据不足且未达最大迭代次数则回到 query_rewriter，
 达到上限则强制生成并标注证据不足，避免死循环。
+
+开启 HITL 时，机器"本来还要再检索一轮"的那一步改为在 human_review 节点中断，
+由调用方用 Command(resume=...) 给出 approve/refine/abort 后再续跑。
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import uuid
 from functools import lru_cache
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 
 from ..checkpoint import get_checkpointer
 from ..config import get_settings
@@ -40,12 +44,14 @@ def route_to_agents(state: AgentState) -> list[str]:
 
 
 def after_critique(state: AgentState) -> str:
-    """反思是否继续：三道闸，缺一道都会让成本或延迟失控。
+    """反思是否继续：四道闸，缺一道都会让成本或延迟失控。
 
     1. 证据已充分 → 直接生成；
     2. 轮次上限 → 防止死循环（原有）；
     3. token 预算 → 每轮都是一次完整检索 + 生成，没有预算上限时成本不可控；
-    4. 本轮零新增证据 → 检索已枯竭，再跑一轮结果不变、成本翻倍。
+    4. 本轮零新增证据 → 检索已枯竭，再跑一轮结果不变、成本翻倍；
+    5. 以上都通过（机器本来还要再检索一轮）→ 若开了 HITL，把决定权交给人工。
+       放在最后是有意的：已经判定"该停"的请求不该再打断人。
     """
     if state.get("grounded"):
         return "generate"
@@ -58,7 +64,23 @@ def after_critique(state: AgentState) -> str:
     if state.get("new_evidence_last_round", 0) == 0:
         logger.debug("本轮无新增有效证据，停止反思")
         return "generate"
+    if settings.hitl_enabled and state.get("review_count", 0) < settings.hitl_max_reviews:
+        return "review"
     return "rewrite_again"
+
+
+def route_after_review(state: AgentState) -> str:
+    """人工决定的三个出口。
+
+    refine 直接回 query_rewriter（不再经过 rewrite_again）：human_review 已经
+    写好了 query_focus 并计入了反思轮次，再走一遍会重复计数。
+    """
+    decision = state.get("review_decision", "approve")
+    if decision == "refine":
+        return "query_rewriter"
+    if decision == "abort":
+        return "refuse"
+    return "generate"
 
 
 async def tool_gate(state: AgentState) -> dict:
@@ -100,6 +122,8 @@ def build_graph(verbose: bool | None = None):
     graph.add_node("critic", nodes.critic)
     graph.add_node("fuse", nodes.fuse)
     graph.add_node("rewrite_again", increment_reflection)
+    graph.add_node("human_review", nodes.human_review)
+    graph.add_node("refuse", nodes.refuse)
     graph.add_node("generate", nodes.generate)
 
     graph.add_edge(START, "orchestrator")
@@ -117,9 +141,16 @@ def build_graph(verbose: bool | None = None):
     graph.add_conditional_edges(
         "critic",
         after_critique,
-        {"generate": "generate", "rewrite_again": "rewrite_again"},
+        {"generate": "generate", "rewrite_again": "rewrite_again", "review": "human_review"},
+    )
+    # 人工确认是图上的真实节点：interrupt 在这里暂停，Command(resume=...) 从这里续跑
+    graph.add_conditional_edges(
+        "human_review",
+        route_after_review,
+        {"generate": "generate", "query_rewriter": "query_rewriter", "refuse": "refuse"},
     )
     graph.add_edge("rewrite_again", "query_rewriter")
+    graph.add_edge("refuse", END)
     graph.add_edge("generate", END)
 
     return graph.compile(checkpointer=get_checkpointer())
@@ -151,6 +182,9 @@ async def run(
     是两条独立路径：history 只把**问题文本**喂给 query_rewriter 做指代消解，
     不恢复上一轮的内部状态——后者会让旧证据/反思计数泄漏到新问题，
     是「多轮越聊越离谱」的典型根因。
+
+    返回约定：`interrupted=True` 表示图停在人工确认点，`review` 是确认单内容，
+    需要把 `thread_id` 与决定一起交给 resume() 才能继续；此时不读也不写答案缓存。
     """
     if verbose is not None:
         configure_logging(verbose)
@@ -163,20 +197,63 @@ async def run(
         str(h.get("question", ""))[:60] for h in history[-3:]
     )
     cache = get_answer_cache()
-    hit = cache.get(cache_key)
-    if hit is not None:
-        metrics.cache_hit()
-        cached = dict(hit)
-        cached["cache_hit"] = True
-        cached.setdefault("traces", [])
-        return cached
-    metrics.cache_miss()
+    # HITL 开启时不读答案缓存：命中缓存会整段跳过图，人工确认环节就永远不触发，
+    # 表现为「同一个问题有时弹确认、有时直接出答案」——比慢一点更难排查。
+    hitl_on = bool(settings.hitl_enabled)
+    if not hitl_on:
+        hit = cache.get(cache_key)
+        if hit is not None:
+            metrics.cache_hit()
+            cached = dict(hit)
+            cached["cache_hit"] = True
+            cached.setdefault("traces", [])
+            return cached
+        metrics.cache_miss()
 
     app = _compiled_app()
+    tid = thread_id or f"run-{uuid.uuid4().hex}"
     result = await app.ainvoke(
         {"question": question, "history": history or []},
-        config={"configurable": {"thread_id": thread_id or f"run-{uuid.uuid4().hex}"}},
+        config={"configurable": {"thread_id": tid}},
     )
+    result["thread_id"] = tid
     result["cache_hit"] = False
-    cache.put(cache_key, result)
+    interrupted = result.pop("__interrupt__", None)
+    if interrupted:
+        # 中断态不写缓存：续跑结果取决于人工决定，缓存某一支会让下一次直接返回旧结论
+        result["interrupted"] = True
+        result["review"] = interrupted[0].value
+        return result
+    result["interrupted"] = False
+    result["review"] = None
+    if not hitl_on:
+        cache.put(cache_key, result)
+    return result
+
+
+async def resume(thread_id: str, decision: str, note: str = "") -> dict:
+    """按人工决定恢复被中断的图。
+
+    thread_id 必须与中断时一致：LangGraph 用它找回该线程的检查点与待恢复的中断。
+    恢复后仍可能再次中断（`HITL_MAX_REVIEWS>1` 时），所以这里与 run() 用同样的返回约定。
+    """
+    app = _compiled_app()
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = await app.aget_state(config)
+    if not snapshot.next:
+        raise ValueError("该 thread_id 没有待人工确认的请求（可能已完成、已恢复或已过期）")
+
+    result = await app.ainvoke(
+        Command(resume={"decision": decision, "note": note}),
+        config=config,
+    )
+    result["thread_id"] = thread_id
+    result["cache_hit"] = False
+    interrupted = result.pop("__interrupt__", None)
+    if interrupted:
+        result["interrupted"] = True
+        result["review"] = interrupted[0].value
+        return result
+    result["interrupted"] = False
+    result["review"] = None
     return result

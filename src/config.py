@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     tool_use_enabled: int = 1
     # 单轮最多接受几个工具调用：防止模型一次塞十几个调用把延迟和上下文打爆
     tool_use_max_calls: int = 3
+    # 1=启用 Human-in-the-loop：Critic 判"证据不足且还能再检索"时中断，等人工决定后
+    # 再续跑（继续生成 / 按补充说明再检索 / 中止拒答）。
+    # 默认关：eval.py 与批处理是无人值守的，中断会让进程停在等人这一步。
+    hitl_enabled: int = 0
+    # 单次请求最多中断几次：>1 会让用户被反复弹窗打断，默认只问一次
+    hitl_max_reviews: int = 1
     # 反馈闭环：默认关闭；开启后写本地 SQLite，生产多实例替换为共享 DB
     feedback_enabled: int = 0
     feedback_db: str = ".agentic_rag_feedback.db"

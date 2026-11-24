@@ -82,6 +82,10 @@
   .node.ok.on { border-color: #abe3cb; background: var(--green-soft); color: var(--green); }
   .node.warn.on { border-color: #f2d49b; background: var(--amber-soft); color: var(--amber); }
   .arrow { align-self: center; color: #b8c2d4; font-size: 14px; }
+  /* 开了 HITL 会多出「人工确认」节点，7 个节点必须收窄才能排在一行 */
+  .pipeline.dense .node { flex: 1 1 70px; min-width: 62px; padding: 8px 5px; }
+  .pipeline.dense .node .n { font-size: 11px; }
+  .pipeline.dense .node .d { font-size: 10px; }
   .loop { text-align: center; margin-top: 9px; font-size: 12px; color: var(--amber); font-weight: 600; display: none; }
   .loop.show { display: block; }
 
@@ -98,6 +102,29 @@
   .pill.bad { background: var(--amber-soft); color: var(--amber); }
   .muted { color: var(--muted); font-size: 12px; }
   .critique { margin-top: 10px; background: #fbfcff; border-left: 3px solid var(--line); padding: 8px 12px; color: #4a5871; font-size: 12px; border-radius: 0 7px 7px 0; }
+
+  /* Human-in-the-loop：Critic 判证据不足时在图上暂停，等人给决定 */
+  .review {
+    margin-top: 14px; border: 1px solid #f0dcb4; background: var(--amber-soft);
+    border-radius: 10px; padding: 13px 15px;
+  }
+  .review h3 { margin: 0 0 8px; font-size: 13px; color: var(--amber); letter-spacing: .01em; }
+  .review .meta { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .review .tag {
+    background: #fff; border: 1px solid #f0dcb8; border-radius: 999px;
+    padding: 2px 9px; font-size: 12px; color: #8a5a05; font-weight: 600;
+  }
+  .review .titles { margin: 6px 0 0; padding-left: 18px; color: #6b5220; font-size: 12px; }
+  .review textarea { margin-top: 10px; min-height: 52px; background: #fff; }
+  .review-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .review-actions button {
+    border: 1px solid var(--line); background: #fff; color: var(--ink);
+    border-radius: 9px; padding: 7px 14px; font: inherit; font-weight: 650; cursor: pointer;
+  }
+  .review-actions button.primary { border: 0; background: var(--brand); color: #fff; }
+  .review-actions button.danger { border-color: #f0c9cb; background: var(--red-soft); color: var(--red); }
+  .review-actions button:disabled { opacity: .55; cursor: default; }
+  .review-hint { color: #8a6a2c; font-size: 12px; margin-top: 8px; }
 
   .empty { color: var(--muted); font-size: 13px; padding: 14px 0; text-align: center; }
   .timeline { position: relative; padding-left: 4px; }
@@ -186,6 +213,13 @@
         <h2><span class="dot"></span>回答 <span class="right" id="citeHint"></span></h2>
         <div class="answer empty" id="answer">运行一次链路后，这里显示可溯源的回答。点击 <b>[引用编号]</b> 可定位到右侧证据。</div>
         <div id="answerExtra"></div>
+        <div class="review" id="reviewPanel" style="display:none">
+          <h3>⚠ Critic 判证据不足 · 等待人工确认</h3>
+          <div id="reviewBody"></div>
+          <textarea id="reviewNote" placeholder="补充说明（选「再检索」时作为下一轮检索侧重，可留空）"></textarea>
+          <div class="review-actions" id="reviewActions"></div>
+          <div class="review-hint" id="reviewHint">图已在 human_review 节点暂停，检查点保留；三种决定都从断点续跑，不会从头重跑。</div>
+        </div>
         <div class="feedback" id="feedbackBar" style="display:none">
           <span class="muted">这条回答有帮助吗？</span>
           <button class="fb" id="fbUp" title="有帮助">👍 有用</button>
@@ -218,7 +252,8 @@
 const LABELS = {
   orchestrator:'编排器', query_rewriter:'查询重写', literature:'文献 agent',
   clinical:'临床试验 agent', report:'影像报告 agent', kg:'知识图谱 agent',
-  fuse:'跨域融合', critic:'Critic 验收', 'reflect-loop':'反思回流', generate:'答案生成'
+  fuse:'跨域融合', critic:'Critic 验收', 'reflect-loop':'反思回流', generate:'答案生成',
+  human_review:'人工确认', refuse:'人工中止', tool_use:'工具选择'
 };
 const PIPELINE = [
   ['orchestrator','编排','数据域分派'],
@@ -236,26 +271,48 @@ const api = p => SHARE_CODE ? `${p}?sharecode=${encodeURIComponent(SHARE_CODE)}`
 let current = null;
 
 function renderPipeline() {
-  $('pipeline').innerHTML = PIPELINE.map(([key,n,d],i) => {
+  // 人工确认只在真的发生过/正在等待时出现，避免未开启 HITL 的演示页多一个死节点
+  const stages = PIPELINE.map(s => [...s]);
+  if (current && (current.interrupted || (current.review_count || 0) > 0)) {
+    stages.splice(stages.length - 1, 0, ['human_review', '人工确认', '断点续跑']);
+  }
+  $('pipeline').classList.toggle('dense', stages.length > 6);
+  $('pipeline').innerHTML = stages.map(([key,n,d],i) => {
     let cls = '';
     if (current) {
       const active = key === 'agents' ? (current.dispatch || []).length > 0
-        : key === 'critic' ? true : (current.traces || []).some(t => t.agent === key);
+        : key === 'critic' ? true
+        : key === 'human_review' ? (current.interrupted || (current.review_count || 0) > 0)
+        : (current.traces || []).some(t => t.agent === key);
       if (active) cls = 'on';
       if (key === 'critic' && current.grounded) cls = 'on ok';
       if (key === 'critic' && !current.grounded) cls = 'on warn';
+      if (key === 'human_review') cls = current.interrupted ? 'on warn' : 'on ok';
     }
     const node = `<div class="node ${cls}"><div class="n">${n}</div><div class="d">${d}</div></div>`;
-    return i < PIPELINE.length - 1 ? node + '<span class="arrow">›</span>' : node;
+    return i < stages.length - 1 ? node + '<span class="arrow">›</span>' : node;
   }).join('');
   const r = current ? (current.reflection_count || 0) : 0;
-  $('loopHint').textContent = r > 0 ? `↺ 触发 ${r} 轮反思回流，重新检索后再验收` : '';
-  $('loopHint').classList.toggle('show', r > 0);
+  const paused = !!(current && current.interrupted);
+  $('loopHint').textContent = paused
+    ? '⏸ 已暂停在人工确认节点，等待你的决定'
+    : (r > 0 ? `↺ 触发 ${r} 轮反思回流，重新检索后再验收` : '');
+  $('loopHint').classList.toggle('show', paused || r > 0);
   $('planText').textContent = current?.plan ? `计划：${current.plan}` : '尚未运行';
 }
 
 function renderAnswer() {
   const box = $('answer');
+  if (current.interrupted) {
+    box.className = 'answer';
+    box.innerHTML = '<span class="muted">链路已在 Critic 之后暂停：证据不足以支撑结论，等待你决定是否继续。确认后答案会显示在这里。</span>';
+    $('citeHint').textContent = '等待人工确认';
+    $('answerExtra').innerHTML = `<div class="status">
+      <span class="pill bad">暂停 · 待人工确认</span>
+      <span class="muted">数据源：${[...new Set((current.evidences || []).map(e => e.source))].join(' / ') || '无'}</span>
+    </div>`;
+    return;
+  }
   const ids = new Set([...(current.citations || []), ...(current.evidences || []).map(e => e.doc_id)]);
   const html = esc(current.answer || '未生成回答。').replace(/\[([^\]\n]{1,60})\]/g, (m, id) =>
     ids.has(id) ? `<span class="cite" data-doc="${esc(id)}" title="点击定位证据">${esc(m)}</span>` : m
@@ -265,13 +322,65 @@ function renderAnswer() {
   box.querySelectorAll('.cite').forEach(el => el.addEventListener('click', () => focusEvidence(el.dataset.doc)));
   $('citeHint').textContent = `有效引用 ${(current.citations || []).length} 条`;
   const good = current.grounded;
+  const decision = current.review_decision;
   $('answerExtra').innerHTML = `
     <div class="status">
       <span class="pill ${good ? 'good' : 'bad'}">${good ? '证据充分' : '证据不足 · 已标注不确定性'}</span>
+      ${decision ? `<span class="pill ${decision === 'abort' ? 'bad' : 'good'}">人工决定：${esc(decision)}</span>` : ''}
       <span class="muted">数据源：${[...new Set((current.evidences || []).map(e => e.source))].join(' / ') || '无'}</span>
       <span class="muted">重写查询 ${(current.rewritten_queries || []).length} 条</span>
     </div>
     ${current.critique ? `<div class="critique">Critic 判据：${esc(current.critique)}</div>` : ''}`;
+}
+
+function renderReview() {
+  const panel = $('reviewPanel');
+  const r = current && current.review;
+  if (!current || !current.interrupted || !r) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  $('reviewHint').textContent = '图已在 human_review 节点暂停，检查点保留；三种决定都从断点续跑，不会从头重跑。';
+  $('reviewBody').innerHTML = `
+    <div class="critique">${esc(r.critique || '')}</div>
+    <div class="meta">
+      <span class="tag">证据 ${r.evidence_count ?? 0} 条</span>
+      <span class="tag">高等级 ${r.high_level_count ?? 0} 条</span>
+      <span class="tag">数据源 ${(r.sources || []).join(' / ') || '无'}</span>
+      <span class="tag">已反思 ${r.reflection_count ?? 0} 轮</span>
+    </div>
+    ${(r.top_titles || []).length ? `<ul class="titles">${r.top_titles.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}`;
+  $('reviewActions').innerHTML = (r.options || []).map((o, i) =>
+    `<button class="${i === 0 ? 'primary' : o.decision === 'abort' ? 'danger' : ''}" data-decision="${esc(o.decision)}" data-label="${esc(o.label)}">${esc(o.label)}</button>`
+  ).join('');
+  $('reviewActions').querySelectorAll('button').forEach(btn =>
+    btn.addEventListener('click', () => submitReview(btn.dataset.decision, btn)));
+}
+
+async function submitReview(decision, btn) {
+  if (!current || !current.thread_id) return;
+  const note = ($('reviewNote').value || '').trim();
+  $('reviewActions').querySelectorAll('button').forEach(b => { b.disabled = true; });
+  btn.innerHTML = '<span class="spinner"></span>续跑中…';
+  try {
+    const res = await fetch(api('/api/ask/resume'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({thread_id: current.thread_id, decision, note})
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    current = await res.json();
+    $('reviewNote').value = '';
+    render();
+    $('feedbackBar').style.display = current.interrupted ? 'none' : 'flex';
+    $('fbUp').classList.remove('voted'); $('fbDown').classList.remove('voted');
+    $('fbStatus').innerHTML = `<span class="reqid">人工决定：${esc(decision)} · thread_id: ${esc(current.thread_id || '')}</span>`;
+  } catch (e) {
+    $('reviewHint').textContent = '续跑失败：' + e.message + '（检查点可能已过期，请重新提问）';
+    $('reviewActions').querySelectorAll('button').forEach(b => { b.disabled = false; });
+    btn.textContent = btn.dataset.label || '重试';
+  }
 }
 
 function renderTimeline() {
@@ -332,7 +441,7 @@ function render() {
   $('latency').textContent = current.latency_ms + ' ms';
   $('tokens').textContent = Object.values(current.token_usage || {}).reduce((a,b) => a + b, 0);
   $('reflections').textContent = current.reflection_count + ' 轮';
-  renderPipeline(); renderAnswer(); renderTimeline(); renderEvidence();
+  renderPipeline(); renderAnswer(); renderTimeline(); renderEvidence(); renderReview();
 }
 
 let activeController = null;
@@ -361,6 +470,7 @@ async function ask(question) {
   btn.onclick = () => controller.abort();
   $('root').classList.add('loading');
   $('feedbackBar').style.display = 'none';
+  $('reviewPanel').style.display = 'none';
   try {
     const res = await fetch(api('/api/ask/stream'), {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -396,9 +506,9 @@ async function ask(question) {
       if (event === 'result') { current = JSON.parse(data); render(); }
     });
     if (current) {
-      $('feedbackBar').style.display = 'flex';
+      $('feedbackBar').style.display = current.interrupted ? 'none' : 'flex';
       const rid = current.request_id || '—';
-      $('fbStatus').innerHTML = `<span class="reqid">request_id: ${esc(rid)}${current.cache_hit ? ' · 缓存命中' : ''}</span>`;
+      $('fbStatus').innerHTML = `<span class="reqid">request_id: ${esc(rid)}${current.cache_hit ? ' · 缓存命中' : ''}${current.interrupted ? ' · 待人工确认' : ''}</span>`;
       $('fbUp').classList.remove('voted'); $('fbDown').classList.remove('voted');
     }
   } catch (e) {

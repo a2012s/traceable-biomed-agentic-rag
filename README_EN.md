@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen.svg)](tests)
 [![CI](https://github.com/a2012s/traceable-biomed-agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/a2012s/traceable-biomed-agentic-rag/actions)
 
 [中文文档](README.md)
@@ -34,7 +34,7 @@ uv pip install -e ".[real-vector]"
 
 python run.py "What is the diagnostic criteria for MS?"
 python eval.py                                  # retrieval evaluation, seconds, no tokens burned
-python -m unittest discover -s tests -t .       # 65 unit / behavior tests
+python -m unittest discover -s tests -t .       # 76 unit / behavior tests
 ```
 
 `pip` works too: `pip install -e ".[real-vector]"`.
@@ -87,6 +87,7 @@ fills gaps with invention. This project puts one engineering constraint on each 
 | Three-way hybrid recall | BM25 exact match + Qdrant HNSW vectors + KG concept expansion, fused with RRF | Single retriever blind spots: drug/gene names via BM25, semantics via vectors, concepts via KG |
 | Cross-domain fusion | Dedupe by `doc_id` → global re-rank by score → drop fragments below 50% of the best | Concatenating each domain's Top-k hides all but the first domain; generic terms pollute citations |
 | Critic reflection | Require ≥1 high-level evidence, ≥2 independent sources, ≥2 matched entities; otherwise loop back with an iteration cap | "Generating anyway when evidence is insufficient" |
+| Human-in-the-loop checkpoint | When the graph would otherwise retrieve another round, it pauses at `human_review` with a review sheet; the human picks continue / refine with a note / abort and the graph resumes | "The mechanism can't tell whether to continue, so it either burns budget or refuses flatly" |
 | Citation validation | Every citation in the answer must exist in the evidence set | Fabricated citations (the most detectable form of hallucination) |
 | Out-of-corpus refusal | Score with "original question + abbreviation expansion" only, never the rewritten generic terms | Rewriter-added "systematic review" makes any document look relevant → false grounding |
 
@@ -159,8 +160,8 @@ distractor leakage unchanged — tool calls contribute to the answer, not just t
 ```
 src/
 ├─ agents/
-│  ├─ graph.py        state machine: conditional edges, parallel fan-out, reflection, checkpointer
-│  ├─ nodes.py        orchestrator / rewriter / four domain agents (factory) / fusion / critic / generate
+│  ├─ graph.py        state machine: conditional edges, fan-out, reflection, HITL interrupt, checkpointer
+│  ├─ nodes.py        orchestrator / rewriter / tool use / domain agents (factory) / fusion / critic / review / generate
 │  ├─ prompts.py      centralized prompts for iteration and evaluation
 │  └─ tool_params.py  tool argument extraction: query ∩ corpus vocabulary, no hardcoded domain nouns
 ├─ rag/
@@ -169,10 +170,14 @@ src/
 │  ├─ embedding.py    pluggable embeddings: hash / tfidf / api (real model)
 │  └─ vector_store.py Qdrant local HNSW + numpy fallback behind one interface
 ├─ tools/biomedical.py  single ToolSpec registry: Pydantic validation, async, error bifurcation, MCP schema
-├─ eval/               golden set, retrieval/generation metrics, evaluation runner
+├─ eval/               golden set, retrieval/generation metrics, runner (bootstrap CI, per-case jsonl)
 ├─ deps.py             lazy dependency container (import does not build an index)
 ├─ state.py            shared state and reducers (dedup-accumulate / additive metering)
 └─ llm.py              real/Mock dual mode, tiered routing, exponential backoff, real token accounting
+
+web/
+├─ server.py           FastAPI: /api/ask (with the interrupted contract), /api/ask/resume, SSE, metrics
+└─ index.html          single-page demo: decision chain, evidence cards, citation highlight, review panel
 ```
 
 ## 6. Design Decisions and Why
@@ -188,6 +193,11 @@ src/
 | Lazy dependency loading | `lru_cache` in `deps.py` | Building an index at module import makes every import pay the full cost and prevents tests from injecting replacements |
 | Error bifurcation | Timeout / 429 → exponential backoff; invalid args / unknown tool → fail immediately | The former is recoverable and worth retrying; the latter only amplifies cost |
 | Single registry | `ToolSpec(name, schema, handler, description)` | Handlers and schemas maintained separately meant forgetting one when adding a tool; now MCP schemas export directly |
+| LLM-driven tool selection | `tool_use` node runs in parallel with the rewriter; the model picks tools from their schemas and results enter the evidence chain | A fixed tool mapping is trace decoration; measured +0.014 Precision and +0.014 citation precision on the default config |
+| Multi-turn passes text, not state | `history` feeds Q/A text to the rewriter for coreference only; the thread's internal state is not reused | Reusing state leaks the previous turn's evidences/reflection_count into a new question — the classic "conversation gets worse over time" bug |
+| HITL as an in-graph interrupt, not an external queue | `interrupt()` pauses at `human_review`; `Command(resume=...)` continues from that point | The checkpoint holds the paused state, so a human decision doesn't re-run prior retrieval and reflection; an external queue would have to persist intermediate state itself |
+| HITL off by default | `HITL_ENABLED=0`; only the web demo turns it on | `eval.py` and batch jobs are unattended — an interrupt leaves the process waiting for a human and would hang offline evaluation |
+| Hold out an evaluation split | 12 cases split 9 dev / 3 test; test is not tuned on; per-case jsonl plus bootstrap CI | Tuning and reporting on the same cases is optimistic; the split report shows dev Recall 1.000 vs test 0.667 |
 | Tests forced offline | `tests/__init__.py` sets `LLM_PROVIDER=mock` | Otherwise local test runs hit the paid API in `.env` (happened in practice) |
 
 ## 7. What's Real vs. Simulated
@@ -203,6 +213,10 @@ Honest labeling beats looking complete — stating real boundaries lets users ju
 | hash embedding | ⚠️ Fallback, semantically weak; crc32 projection makes it reproducible across processes (not randomized `hash()`) |
 | Cross-encoder re-ranking | ⚠️ Simulated with IDF-weighted cosine + priors; swap `score()` for bge-reranker |
 | Four biomedical tools | ⚠️ Backed by local corpus; replace `pubmed_search` etc. with real APIs |
+| LLM tool selection | ✅ Real call chain (model output → Pydantic validation → dispatch → reranker → evidence); mock mode simulates it with domain rules |
+| Multi-turn coreference | ⚠️ Context passing and cache isolation are real; mock mode resolves by vocabulary lookup, a real model does it via prompt |
+| 95% confidence intervals | ✅ Bootstrap resampling; but with n=12 the interval is wide, so it expresses uncertainty rather than significance |
+| Human-in-the-loop checkpoint | ✅ Real pause/resume through LangGraph `interrupt` + `Command(resume)`, with three distinct exits; how long the pause survives depends on the checkpointer |
 | Critic | ⚠️ Rule-based (interpretable, zero cost), not an LLM judge |
 | Corpus | ⚠️ Fictional teaching data, identifiers unrelated to real records |
 
@@ -228,8 +242,29 @@ offline demo is unaffected. Configuration keys are in `.env.example`.
 | Retrieval robustness | `FUSE_MIN_KEEP` / `RRF_K` / `RERANK_CANDIDATES` | Fusion floor prevents "outlier best score → single evidence → guaranteed refusal"; RRF filters by domain before assigning ranks; re-ranking only sees the top N candidates |
 | Cost gate | `MAX_TOKENS_PER_REQUEST` | Beyond the iteration cap, reflection also stops on a token budget or on zero new evidence, so exhausted queries don't spin |
 | Re-ranker circuit breaker | `RERANKER_TIMEOUT_S` / `RERANKER_BREAKER_COOLDOWN_S` | Batched request (no per-document HTTP) + instance-level breaker that never mutates global config |
+| Human-in-the-loop checkpoint | `HITL_ENABLED=1` | When the Critic finds evidence insufficient and the graph would retrieve again, `POST /api/ask` returns `interrupted=true` plus a review sheet; `POST /api/ask/resume` takes `thread_id` and a decision (see the snippet below) |
 
-Measured: `python -m unittest discover -s tests -t .` passes 65 tests; `python eval.py` and
+The three decisions: `approve` continues generating with the caveat (evidence unchanged, `grounded`
+stays false); `refine` folds the human note into `query_focus` and runs one more retrieval round
+(counted against `MAX_REFLECTIONS`, so repeated clicks can't bypass the cap); `abort` goes to a
+dedicated `refuse` node and **never calls the generation model**.
+
+```bash
+# 1) Interrupt: the Critic finds the evidence insufficient, the graph pauses at human_review
+curl -s localhost:8765/api/ask -H 'Content-Type: application/json' \
+  -d '{"question":"Applications of mass spectrometry in serum protein quantification"}'
+# → {"interrupted": true, "thread_id": "web-…", "review": {"critique": "…", "options": [...] }}
+
+# 2) Resume with one of the three decisions, optionally with a note
+curl -s localhost:8765/api/ask/resume -H 'Content-Type: application/json' \
+  -d '{"thread_id":"web-…","decision":"refine","note":"serum protein quantification only"}'
+# → {"interrupted": false, "review_decision": "refine", "reflection_count": 1, "answer": "…"}
+```
+
+Resuming a finished thread returns 409 (it never silently re-runs and charges twice); an unknown
+`decision` returns 422.
+
+Measured: `python -m unittest discover -s tests -t .` passes 76 tests; `python eval.py` and
 `python eval.py --full` show no metric regression.
 
 Still demo-scope and not claimed as done: real corpus and version filtering, token-level streaming,
@@ -262,6 +297,8 @@ state (evidence tagged with branch/tag, Critic filtering cross-version evidence)
   complex contexts
 - The re-ranker is an IDF-weighted cosine approximation, not a real cross-encoder; semantic
   paraphrase queries still need `EMBEDDING_BACKEND=api`
+- The HITL pause lives in the checkpointer: with `CHECKPOINTER=memory` (default) it is lost on
+  restart and not shared across workers — production needs `sqlite`/Redis for reviews to survive
 
 ## 10. Five Core Design Takeaways
 
@@ -286,10 +323,15 @@ state (evidence tagged with branch/tag, Critic filtering cross-version evidence)
 | `What is the diagnostic criteria for MS?` | Abbreviation disambiguation works: only multiple sclerosis is expanded; mass-spectrometry methodology papers stay out of citations |
 | `Applications of mass spectrometry in serum protein quantification` | Insufficient evidence level → multiple reflection loop-backs → honestly labeled "insufficient evidence" |
 | `Long-term safety of CRISPR base editing in sickle cell disease?` | Out-of-corpus question: empty evidence, `grounded=False`, explicit refusal after hitting the iteration cap |
+| `Applications of mass spectrometry in serum protein quantification` (with `HITL_ENABLED=1`) | The Critic finds evidence insufficient → the graph pauses with a review sheet; `refine` runs one more round with your note, `abort` refuses without calling the generation model |
 
 ```bash
 VERBOSE=1 python run.py "Applications of mass spectrometry in serum protein quantification"  # live decision chain
+HITL_ENABLED=1 uvicorn web.server:app --port 8765                                          # enable the review panel
 ```
+
+> The out-of-corpus (CRISPR) case does not pause for review: zero evidence means retrieval is
+> exhausted, so asking a human adds noise — the graph goes straight to refusal.
 
 ## 12. Open Source and Contributing
 

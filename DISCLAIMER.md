@@ -19,6 +19,7 @@
 - 多智能体编排与状态机（LangGraph）
 - 混合检索、查询重写、重排与向量库接入
 - 引用合法性校验与反思回流
+- Human-in-the-loop 断点（证据不足时暂停，人工决定继续/再检索/中止）
 - 自动化评估体系
 
 它**不是**医疗决策支持系统，不提供任何诊断或治疗建议。
@@ -30,6 +31,8 @@
 | 语料 | 虚构内置数据 | PubMed/内部数仓真实数据，保留原始 ID 与原文 |
 | Embedding | TF-IDF / 哈希 | 领域模型（BioBERT / BGE-M3 / text-embedding-v3） |
 | Reranker | 可解释特征打分 | Cross-encoder（bge-reranker-v2-m3） |
+| 工具调用 | 本地语料模拟的 4 个工具 | PubMed / ClinicalTrials.gov / UMLS 真实 API，带鉴权与配额 |
+| 人工确认 | 图内断点 + Web 确认面板（默认关） | 接入真实工单/审核流，断点检查点落 Redis 等共享存储 |
 | Critic | 规则判定 | LLM-as-judge + 医学专家复核 |
 | 评估金标 | 自建小样本 | 领域专家标注 + RAGAS |
 

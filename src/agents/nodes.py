@@ -9,6 +9,8 @@ import logging
 import time
 from collections.abc import Callable
 
+from langgraph.types import interrupt
+
 from ..config import get_settings
 from ..deps import get_llm, get_reranker, get_retriever
 from ..llm import parse_json_loose
@@ -379,6 +381,91 @@ async def critic(state: AgentState) -> dict:
         "grounded": grounded,
         "traces": [entry],
         "token_usage": {"critic": 0},
+    }
+
+
+REVIEW_OPTIONS: tuple[dict[str, str], ...] = (
+    {"decision": "approve", "label": "带不确定性继续生成"},
+    {"decision": "refine", "label": "按补充说明再检索一轮"},
+    {"decision": "abort", "label": "中止并明确拒答"},
+)
+
+
+async def human_review(state: AgentState) -> dict:
+    """Critic 判不足时暂停图，等人工决定后继续。
+
+    `interrupt()` 抛出后节点被保存为「待恢复」；恢复时**整个节点从头重跑**，
+    因此函数体里只能有纯计算，不能写库/发通知/累加计数器——否则恢复一次就重复一次。
+    返回的 dict 只在人工真正给出决定后才写入状态。
+
+    三种决定的语义：
+    - approve：带不确定性继续生成（证据不变，`grounded=False` 会让答案标注局限）；
+    - refine：把人工补充说明拼进 `query_focus`，再走一轮检索与验收；
+    - abort：不让模型在没有充分证据时补脑，直接输出明确拒答。
+    """
+    start = time.perf_counter()
+    evidences: list[Evidence] = state.get("evidences", [])
+    # 防御：已到中断上限就直接放行到生成，不再发第二次确认单
+    if state.get("review_count", 0) >= max(1, settings.hitl_max_reviews):
+        return {"review_decision": "approve"}
+
+    payload = {
+        "reason": "critic_insufficient",
+        "question": state.get("question", ""),
+        "critique": state.get("critique", ""),
+        "evidence_count": len(evidences),
+        "high_level_count": sum(1 for e in evidences if e.get("evidence_level") in ("1", "2")),
+        "sources": sorted({e.get("source", "") for e in evidences}),
+        "top_titles": [e.get("title", "") for e in evidences[:3]],
+        "reflection_count": state.get("reflection_count", 0),
+        "options": [dict(option) for option in REVIEW_OPTIONS],
+    }
+    answer = interrupt(payload)
+
+    if isinstance(answer, dict):
+        decision = str(answer.get("decision", "approve")).strip().lower()
+        note = str(answer.get("note", "")).strip()[:200]
+    else:  # 兼容 Command(resume="approve") 这类简写
+        decision, note = str(answer).strip().lower(), ""
+    if decision not in {"approve", "refine", "abort"}:
+        # 未知决策按 approve 处理：若猜成 refine 会白跑一轮检索与生成
+        decision, note = "approve", ""
+
+    detail = f"人工确认：{decision}" + (f"（补充：{note}）" if note else "")
+    update: dict = {
+        "review_count": state.get("review_count", 0) + 1,
+        "review_decision": decision,
+        "review_note": note,
+        "review_payload": payload,
+        "traces": [_trace("human_review", "review", detail, start, 0)],
+        "token_usage": {},
+    }
+    if decision == "refine":
+        focus = state.get("critique", "")
+        if note:
+            focus = f"{focus}；人工补充：{note}"
+        update["query_focus"] = focus
+        # 与 rewrite_again 节点口径一致：人工要求再检索也计入反思轮次，
+        # 否则反复点 refine 就能绕过 MAX_REFLECTIONS 把成本拉满
+        update["reflection_count"] = state.get("reflection_count", 0) + 1
+    return update
+
+
+async def refuse(state: AgentState) -> dict:
+    """人工中止：明确拒答，不调用生成模型。"""
+    start = time.perf_counter()
+    answer = (
+        "已按人工确认中止本次回答：现有证据不足以支撑结论，不做推断。"
+        "如需继续，请补充更具体的临床问题或指定数据源后重试。"
+    )
+    entry = _trace("refuse", "abort", "人工中止，输出明确拒答（不调用生成模型）", start, 0)
+    _verbose(entry)
+    return {
+        "answer": answer,
+        "citations": [],
+        "final": f"{answer}\n\n证据来源：未引用",
+        "traces": [entry],
+        "token_usage": {"generate": 0},
     }
 
 
